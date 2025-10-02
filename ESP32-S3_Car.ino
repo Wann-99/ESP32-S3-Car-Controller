@@ -200,6 +200,8 @@ unsigned long Len_Integer = 0; //
 unsigned int Len_Fraction = 0;
 
 float getDistance() {
+  Serial.println("=== 开始超声波测距 ===");
+  
   // 触发超声波脉冲 (严格按照HC-SR04时序)
   digitalWrite(ULTRASONIC_TRIG, LOW);
   delayMicroseconds(2);
@@ -207,11 +209,18 @@ float getDistance() {
   delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG, LOW);
   
+  Serial.println("触发脉冲已发送");
+  
   // 测量回波时间，设置60ms超时（对应约10米最大距离）
   Time_Echo_us = pulseIn(ULTRASONIC_ECHO, HIGH, 60000);
   
+  Serial.print("回波时间: ");
+  Serial.print(Time_Echo_us);
+  Serial.println(" 微秒");
+  
   // 严格的超时和有效性检测 (参考HC-SR04例程)
   if (Time_Echo_us == 0 || Time_Echo_us < 1 || Time_Echo_us > 60000) {
+    Serial.println("超声波测距失败: 超时或无效读数");
     return 999.0; // 返回最大值表示超出范围或错误
   }
   
@@ -482,6 +491,159 @@ void handleWebAPI(AsyncWebServerRequest *request) {
   request->send(200, "application/json", response);
 }
 
+// New RESTful API handlers
+void handleCarMovement(AsyncWebServerRequest *request, const char* action) {
+  esp_task_wdt_reset();
+  
+  static char response[200];
+  
+  if (strcmp(action, "forward") == 0) {
+    moveForward();
+  } else if (strcmp(action, "backward") == 0) {
+    moveBackward();
+  } else if (strcmp(action, "left") == 0) {
+    turnLeft();
+  } else if (strcmp(action, "right") == 0) {
+    turnRight();
+  } else if (strcmp(action, "leftside") == 0) {
+    moveLeftSide();
+  } else if (strcmp(action, "rightside") == 0) {
+    moveRightSide();
+  } else if (strcmp(action, "rotateleft") == 0) {
+    rotateLeft();
+  } else if (strcmp(action, "rotateright") == 0) {
+    rotateRight();
+  } else if (strcmp(action, "stop") == 0) {
+    stopMotors();
+  }
+  
+  snprintf(response, sizeof(response), "{\"status\":\"ok\",\"action\":\"%s\"}", action);
+  request->send(200, "application/json", response);
+}
+
+void handleSpeedControl(AsyncWebServerRequest *request) {
+  esp_task_wdt_reset();
+  
+  if (request->hasParam("speed", true)) {
+    int percent = request->getParam("speed", true)->value().toInt();
+    setSpeedPercent(percent);
+    
+    static char response[200];
+    snprintf(response, sizeof(response), 
+      "{\"status\":\"ok\",\"action\":\"speed\",\"percent\":%d,\"speed\":%d}", 
+      speedPercent, motorSpeed);
+    request->send(200, "application/json", response);
+  } else {
+    request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing speed parameter\"}");
+  }
+}
+
+void handleServoControl(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  esp_task_wdt_reset();
+  
+  // 首先检查URL参数（向后兼容）
+  if (request->hasParam("value", true)) {
+    float angle = request->getParam("value", true)->value().toFloat();
+    angle = constrain(angle, 0.0, 180.0);
+    
+    esp_task_wdt_reset();
+    setServoAngle(angle);
+    esp_task_wdt_reset();
+    
+    static char response[200];
+    snprintf(response, sizeof(response), 
+      "{\"status\":\"ok\",\"action\":\"servo\",\"servo_angle\":%.2f}", angle);
+    request->send(200, "application/json", response);
+    return;
+  } 
+  // 也支持angle参数（向后兼容）
+  else if (request->hasParam("angle", true)) {
+    float angle = request->getParam("angle", true)->value().toFloat();
+    angle = constrain(angle, 0.0, 180.0);
+    
+    esp_task_wdt_reset();
+    setServoAngle(angle);
+    esp_task_wdt_reset();
+    
+    static char response[200];
+    snprintf(response, sizeof(response), 
+      "{\"status\":\"ok\",\"action\":\"servo\",\"servo_angle\":%.2f}", angle);
+    request->send(200, "application/json", response);
+    return;
+  }
+  
+  // 处理JSON请求体
+  if (data && len > 0) {
+    String body = String((char*)data);
+    Serial.println("Servo control body: " + body);
+    
+    // 简单的JSON解析（查找value字段）
+    int valueIndex = body.indexOf("\"value\":");
+    if (valueIndex != -1) {
+      int startIndex = valueIndex + 8; // "value":后面的位置
+      int endIndex = body.indexOf(',', startIndex);
+      if (endIndex == -1) endIndex = body.indexOf('}', startIndex);
+      
+      if (endIndex != -1) {
+        String valueStr = body.substring(startIndex, endIndex);
+        valueStr.trim();
+        float angle = valueStr.toFloat();
+        angle = constrain(angle, 0.0, 180.0);
+        
+        Serial.println("Parsed servo angle: " + String(angle));
+        
+        esp_task_wdt_reset();
+        setServoAngle(angle);
+        esp_task_wdt_reset();
+        
+        static char response[200];
+        snprintf(response, sizeof(response), 
+          "{\"status\":\"ok\",\"action\":\"servo\",\"servo_angle\":%.2f}", angle);
+        request->send(200, "application/json", response);
+        return;
+      }
+    }
+  }
+  
+  request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing value or angle parameter\"}");
+}
+
+void handleStatusRequest(AsyncWebServerRequest *request) {
+  esp_task_wdt_reset();
+  
+  Serial.println("=== 处理状态请求 ===");
+  float distance = getDistance();
+  Serial.print("获取到的距离: ");
+  Serial.println(distance);
+  
+  static char response[400];
+  
+  // 增强状态响应，包含舵机角度信息
+  if (distance >= 999.0) {
+    // 超声波传感器错误或超出范围
+    Serial.println("状态: 超声波传感器错误");
+    snprintf(response, sizeof(response), 
+      "{\"status\":\"error\",\"distance\":999,\"speed\":%d,\"percent\":%d,\"servo_angle\":%.2f,\"safe_distance\":%.1f,\"message\":\"Ultrasonic sensor error\"}", 
+      motorSpeed, speedPercent, currentServoAngle, SAFE_DISTANCE);
+  } else if (distance < SAFE_DISTANCE) {
+    // 距离过近，警告状态
+    Serial.println("状态: 距离过近警告");
+    snprintf(response, sizeof(response), 
+      "{\"status\":\"warning\",\"distance\":%.2f,\"speed\":%d,\"percent\":%d,\"servo_angle\":%.2f,\"safe_distance\":%.1f,\"message\":\"Distance too close\"}", 
+      distance, motorSpeed, speedPercent, currentServoAngle, SAFE_DISTANCE);
+  } else {
+    // 正常状态
+    Serial.println("状态: 正常");
+    snprintf(response, sizeof(response), 
+      "{\"status\":\"ok\",\"distance\":%.2f,\"speed\":%d,\"percent\":%d,\"servo_angle\":%.2f,\"safe_distance\":%.1f}", 
+      distance, motorSpeed, speedPercent, currentServoAngle, SAFE_DISTANCE);
+  }
+  
+  Serial.print("发送响应: ");
+  Serial.println(response);
+  request->send(200, "application/json", response);
+}
+
 // Optimized Web control page
 const char* webPage = R"HTML(
 <!DOCTYPE html>
@@ -489,127 +651,482 @@ const char* webPage = R"HTML(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32-S3 Smart Car Control</title>
+    <title>ESP32-S3 智能小车控制台</title>
     <style>
-        body { font-family: Arial; text-align: center; margin: 20px; background: #f0f0f0; }
-        .container { max-width: 400px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .control-btn { width: 80px; height: 80px; margin: 5px; font-size: 16px; border: none; border-radius: 10px; cursor: pointer; }
-        .forward { background: #4CAF50; color: white; }
-        .backward { background: #f44336; color: white; }
-        .left { background: #2196F3; color: white; }
-        .right { background: #FF9800; color: white; }
-        .stop { background: #9E9E9E; color: white; }
-        .strafe { background: #4CAF50; color: white; }
-        .rotate { background: #E91E63; color: white; }
-        .speed-control { margin: 20px 0; }
-        .status { margin: 10px 0; padding: 10px; background: #e8f5e8; border-radius: 5px; }
-        #distance { font-size: 24px; color: #2196F3; }
-        .movement-section { margin: 20px 0; padding: 15px; border: 2px solid #ddd; border-radius: 10px; }
-        .movement-title { font-weight: bold; margin-bottom: 10px; color: #333; }
-        .servo-buttons { 
-            display: flex; 
-            justify-content: center; 
-            align-items: center; 
-            margin-top: 10px; 
-            gap: 15px; 
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
+        
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 10px;
+            color: #333;
+        }
+        
+        .main-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .left-panel, .right-panel {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 25px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 25px;
+            grid-column: 1 / -1;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 20px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+        }
+        
+        .header h1 {
+            color: #4a5568;
+            font-size: 2.2em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .header .subtitle {
+            color: #718096;
+            font-size: 1.1em;
+        }
+        
+        .video-section {
+            margin-bottom: 25px;
+        }
+        
+        .video-container {
+            position: relative;
+            background: #000;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            margin-bottom: 15px;
+        }
+        
+        .video-stream {
+            width: 100%;
+            height: 280px;
+            object-fit: cover;
+            display: block;
+        }
+        
+        .video-placeholder {
+            width: 100%;
+            height: 280px;
+            background: linear-gradient(45deg, #2d3748, #4a5568);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 1.2em;
+            text-align: center;
+        }
+        
+        .video-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .video-input {
+            flex: 1;
+            padding: 10px 15px;
+            border: 2px solid #e2e8f0;
+            border-radius: 10px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        
+        .video-input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .video-btn {
+            padding: 10px 20px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .video-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .status-panel {
+            background: linear-gradient(135deg, #48bb78, #38a169);
+            color: white;
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 25px;
+            box-shadow: 0 8px 20px rgba(72, 187, 120, 0.3);
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+        }
+        
+        .status-item {
+            text-align: center;
+            background: rgba(255, 255, 255, 0.2);
+            padding: 15px;
+            border-radius: 10px;
+        }
+        
+        .status-label {
+            font-size: 0.9em;
+            opacity: 0.9;
+            margin-bottom: 5px;
+        }
+        
+        .status-value {
+            font-size: 1.8em;
+            font-weight: bold;
+        }
+        
+        .control-btn { 
+            width: 85px; 
+            height: 85px; 
+            margin: 8px; 
+            font-size: 14px; 
+            font-weight: 600;
+            border: none; 
+            border-radius: 15px; 
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .control-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.2);
+        }
+        
+        .control-btn:active {
+            transform: translateY(-1px);
+        }
+        
+        .forward { 
+            background: linear-gradient(135deg, #48bb78, #38a169);
+            color: white; 
+        }
+        .backward { 
+            background: linear-gradient(135deg, #f56565, #e53e3e);
+            color: white; 
+        }
+        .left { 
+            background: linear-gradient(135deg, #4299e1, #3182ce);
+            color: white; 
+        }
+        .right { 
+            background: linear-gradient(135deg, #ed8936, #dd6b20);
+            color: white; 
+        }
+        .stop { 
+            background: linear-gradient(135deg, #a0aec0, #718096);
+            color: white; 
+        }
+        .strafe { 
+            background: linear-gradient(135deg, #9f7aea, #805ad5);
+            color: white; 
+        }
+        .rotate { 
+            background: linear-gradient(135deg, #ed64a6, #d53f8c);
+            color: white; 
+        }
+        
+        .movement-section { 
+            margin: 25px 0; 
+            padding: 20px; 
+            background: rgba(247, 250, 252, 0.8);
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }
+        
+        .movement-title { 
+            font-weight: 700; 
+            margin-bottom: 15px; 
+            color: #2d3748;
+            font-size: 1.2em;
+            text-align: center;
+        }
+        
+        .control-grid {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .control-row {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+        }
+        
+        .slider-container {
+            background: rgba(247, 250, 252, 0.8);
+            padding: 20px;
+            border-radius: 15px;
+            margin: 15px 0;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }
+        
+        .slider-label {
+            font-weight: 600;
+            color: #2d3748;
+            margin-bottom: 10px;
+            display: block;
+        }
+        
+        .slider {
+            width: 100%;
+            height: 8px;
+            border-radius: 5px;
+            background: #e2e8f0;
+            outline: none;
+            -webkit-appearance: none;
+            margin: 10px 0;
+        }
+        
+        .slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            cursor: pointer;
+            box-shadow: 0 2px 10px rgba(102, 126, 234, 0.3);
+        }
+        
+        .slider::-moz-range-thumb {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            cursor: pointer;
+            border: none;
+            box-shadow: 0 2px 10px rgba(102, 126, 234, 0.3);
+        }
+        
+        .servo-controls {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+        
         .servo-adjuster {
             display: flex;
-            border: 2px solid #607D8B;
+            border: 2px solid #667eea;
             border-radius: 25px;
             overflow: hidden;
         }
-        .servo-buttons .control-btn { 
-            width: 45px; 
-            height: 45px; 
-            font-size: 20px; 
+        
+        .servo-btn {
+            width: 45px;
+            height: 45px;
+            font-size: 18px;
             font-weight: bold;
-            background: #607D8B; 
-            color: white; 
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
             border: none;
             cursor: pointer;
-            transition: background-color 0.2s;
+            transition: all 0.2s;
         }
-        .servo-buttons .control-btn:hover {
-            background: #546E7A;
+        
+        .servo-btn:hover {
+            background: linear-gradient(135deg, #5a67d8, #6b46c1);
         }
-        .servo-buttons .control-btn:active {
-            background: #455A64;
-        }
-        .servo-buttons .control-btn.decrease {
-            border-radius: 0;
-        }
-        .servo-buttons .control-btn.increase {
-            border-radius: 0;
-        }
-        .servo-buttons input[type="number"] { 
-            text-align: center; 
-            border: 1px solid #ccc; 
-            border-radius: 5px; 
-            padding: 8px; 
+        
+        .servo-input {
+            width: 80px;
+            text-align: center;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 8px;
             font-size: 14px;
+        }
+        
+        .keyboard-hints {
+            background: rgba(247, 250, 252, 0.8);
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            font-size: 0.9em;
+            color: #4a5568;
+        }
+        
+        .keyboard-hints h4 {
+            margin-bottom: 10px;
+            color: #2d3748;
+        }
+        
+        .hint-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 8px;
+        }
+        
+        @media (max-width: 768px) {
+            .main-container {
+                grid-template-columns: 1fr;
+                gap: 15px;
+            }
+            
+            .control-btn {
+                width: 70px;
+                height: 70px;
+                font-size: 12px;
+            }
+            
+            .header h1 {
+                font-size: 1.8em;
+            }
+            
+            .video-stream, .video-placeholder {
+                height: 200px;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h2>ESP32-S3 Smart Car</h2>
-        
-        <div class="status">
-            <div>Distance: <span id="distance">--</span> cm</div>
-            <div>Safe Distance: <span id="safeDistance">20</span> cm</div>
-            <div>Speed: <span id="speedPercent">50</span>%</div>
+    <div class="main-container">
+        <div class="header">
+            <h1>🚗 ESP32-S3 智能小车控制台</h1>
+            <div class="subtitle">高精度麦克纳姆轮控制系统</div>
         </div>
         
-        <div class="movement-section">
-            <div class="movement-title">基本运动控制</div>
-            <div style="margin: 10px 0;">
-                <div>
-                    <button class="control-btn forward" onmousedown="startMovement('forward')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↑<br>前进</button>
+        <div class="left-panel">
+            <div class="video-section">
+                <h3 style="margin-bottom: 15px; color: #2d3748;">📹 实时视频监控</h3>
+                <div class="video-container">
+                    <div id="videoPlaceholder" class="video-placeholder">
+                        <div>
+                            <div style="font-size: 3em; margin-bottom: 10px;">📷</div>
+                            <div>请输入摄像头IP地址</div>
+                            <div style="font-size: 0.9em; opacity: 0.7; margin-top: 5px;">支持ESP32-CAM等设备</div>
+                        </div>
+                    </div>
+                    <img id="videoStream" class="video-stream" style="display: none;" alt="视频流">
                 </div>
-                <div>
-                    <button class="control-btn left" onmousedown="startMovement('left')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↰<br>左转</button>
-                    <button class="control-btn stop" onclick="sendCommand('stop')">■<br>停止</button>
-                    <button class="control-btn right" onmousedown="startMovement('right')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↱<br>右转</button>
+                <div class="video-controls">
+                    <input type="text" id="cameraIP" class="video-input" placeholder="输入摄像头IP (例: 192.168.1.100)" value="">
+                    <button onclick="connectCamera()" class="video-btn">连接摄像头</button>
+                    <button onclick="disconnectCamera()" class="video-btn" style="background: linear-gradient(135deg, #f56565, #e53e3e);">断开连接</button>
                 </div>
-                <div>
-                    <button class="control-btn backward" onmousedown="startMovement('backward')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↓<br>后退</button>
+            </div>
+            
+            <div class="status-panel">
+                <h3 style="margin-bottom: 15px; text-align: center;">📊 系统状态</h3>
+                <div class="status-grid">
+                    <div class="status-item">
+                        <div class="status-label">距离检测</div>
+                        <div class="status-value"><span id="distance">--</span> cm</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">安全距离</div>
+                        <div class="status-value"><span id="safeDistance">10</span> cm</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">当前速度</div>
+                        <div class="status-value"><span id="speedPercent">78</span>%</div>
+                    </div>
                 </div>
             </div>
         </div>
         
-        <div class="movement-section">
-            <div class="movement-title">麦轮高级运动控制</div>
-            <div style="margin: 10px 0;">
-                <div>
-                    <button class="control-btn strafe" onmousedown="startMovement('leftside')" onmouseup="stopMovement()" onmouseleave="stopMovement()">←<br>麦轮左平移</button>
-                    <button class="control-btn strafe" onmousedown="startMovement('rightside')" onmouseup="stopMovement()" onmouseleave="stopMovement()">→<br>麦轮右平移</button>
-                </div>
-                <div style="margin-top: 10px;">
-                    <button class="control-btn rotate" onmousedown="startMovement('rotateleft')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↺<br>左掉头</button>
-                    <button class="control-btn rotate" onmousedown="startMovement('rotateright')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↻<br>右掉头</button>
+        <div class="right-panel">
+            <div class="movement-section">
+                <div class="movement-title">🎮 基本运动控制</div>
+                <div class="control-grid">
+                    <div class="control-row">
+                        <button class="control-btn forward" onmousedown="startMovement('forward')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↑<br>前进</button>
+                    </div>
+                    <div class="control-row">
+                        <button class="control-btn left" onmousedown="startMovement('left')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↰<br>左转</button>
+                        <button class="control-btn stop" onclick="sendCommand('stop')">■<br>停止</button>
+                        <button class="control-btn right" onmousedown="startMovement('right')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↱<br>右转</button>
+                    </div>
+                    <div class="control-row">
+                        <button class="control-btn backward" onmousedown="startMovement('backward')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↓<br>后退</button>
+                    </div>
                 </div>
             </div>
-        </div>
-        
-        <div class="speed-control">
-            <label>速度控制 (%): </label>
-            <input type="range" id="speedSlider" min="20" max="100" value="50" onchange="setSpeedPercent(this.value)">
-            <span id="speedValue">50</span>%
-        </div>
-        
-        <div class="speed-control">
-            <label>舵机控制: </label>
-            <input type="range" id="servoSlider" min="0" max="180" step="0.18" value="90" onchange="setServo(this.value)">
-            <div>角度: <span id="servoAngle">90</span>°</div>
-            <div class="servo-buttons">
-                <div class="servo-adjuster">
-                    <button class="control-btn decrease" onmousedown="startAdjust(-1)" onmouseup="stopAdjust()" onmouseleave="stopAdjust()">-</button>
-                    <button class="control-btn increase" onmousedown="startAdjust(1)" onmouseup="stopAdjust()" onmouseleave="stopAdjust()">+</button>
+            
+            <div class="movement-section">
+                <div class="movement-title">⚙️ 麦轮高级控制</div>
+                <div class="control-grid">
+                    <div class="control-row">
+                        <button class="control-btn strafe" onmousedown="startMovement('leftShift')" onmouseup="stopMovement()" onmouseleave="stopMovement()">←<br>左平移</button>
+                        <button class="control-btn strafe" onmousedown="startMovement('rightShift')" onmouseup="stopMovement()" onmouseleave="stopMovement()">→<br>右平移</button>
+                    </div>
+                    <div class="control-row">
+                        <button class="control-btn rotate" onmousedown="startMovement('leftTurn')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↺<br>左掉头</button>
+                        <button class="control-btn rotate" onmousedown="startMovement('rightTurn')" onmouseup="stopMovement()" onmouseleave="stopMovement()">↻<br>右掉头</button>
+                    </div>
                 </div>
-                <input type="number" id="servoInput" min="0" max="180" step="0.18" value="90" onchange="setServoFromInput(this.value)" style="width: 60px; margin: 0 5px;" placeholder="角度">
             </div>
-        </div>
+            
+            <div class="slider-container">
+                <label class="slider-label">🚀 速度控制: <span id="speedValue">78</span>%</label>
+                <input type="range" id="speedSlider" class="slider" min="20" max="100" value="78" onchange="setSpeedPercent(this.value)">
+            </div>
+            
+            <div class="slider-container">
+                <label class="slider-label">🎯 舵机控制: <span id="servoAngle">90</span>°</label>
+                <input type="range" id="servoSlider" class="slider" min="0" max="180" step="0.18" value="90" onchange="setServo(this.value)">
+                <div class="servo-controls">
+                    <div class="servo-adjuster">
+                        <button class="servo-btn" onmousedown="startAdjust(-1)" onmouseup="stopAdjust()" onmouseleave="stopAdjust()">-</button>
+                        <button class="servo-btn" onmousedown="startAdjust(1)" onmouseup="stopAdjust()" onmouseleave="stopAdjust()">+</button>
+                    </div>
+                    <input type="number" id="servoInput" class="servo-input" min="0" max="180" step="0.18" value="90" onchange="setServoFromInput(this.value)" placeholder="角度">
+                </div>
+            </div>
+            
+            <div class="keyboard-hints">
+                <h4>⌨️ 键盘快捷键</h4>
+                <div class="hint-grid">
+                    <div>↑/W: 前进</div>
+                    <div>↓/S: 后退</div>
+                    <div>←/A: 左转</div>
+                    <div>→/D: 右转</div>
+                    <div>Q: 左掉头</div>
+                    <div>E: 右掉头</div>
+                    <div>Z: 左平移</div>
+                    <div>C: 右平移</div>
+                    <div>空格: 停止</div>
+                </div>
+            </div>
     </div>
 
     <script>
@@ -617,8 +1134,137 @@ const char* webPage = R"HTML(
         let isMoving = false;
         let currentAction = null;
         
+        // 视频流相关变量
+        let videoConnected = false;
+        let videoCheckInterval = null;
+        
+        // 视频流功能
+        function connectCamera() {
+            const cameraIP = document.getElementById('cameraIP').value.trim();
+            if (!cameraIP) {
+                alert('请输入摄像头IP地址');
+                return;
+            }
+            
+            // 支持多种常见的ESP32-CAM视频流格式
+            const videoUrls = [
+                `http://${cameraIP}/stream`,
+                `http://${cameraIP}:81/stream`,
+                `http://${cameraIP}/mjpeg/1`,
+                `http://${cameraIP}/video`,
+                `http://${cameraIP}/cam-hi.jpg`
+            ];
+            
+            const videoStream = document.getElementById('videoStream');
+            const videoPlaceholder = document.getElementById('videoPlaceholder');
+            
+            // 尝试连接第一个URL
+            tryConnectVideo(videoUrls, 0, videoStream, videoPlaceholder);
+        }
+        
+        function tryConnectVideo(urls, index, videoElement, placeholderElement) {
+            if (index >= urls.length) {
+                alert('无法连接到摄像头，请检查IP地址和网络连接');
+                return;
+            }
+            
+            const currentUrl = urls[index];
+            console.log(`尝试连接视频流: ${currentUrl}`);
+            
+            // 创建新的图片元素进行测试
+            const testImg = new Image();
+            testImg.onload = function() {
+                // 连接成功
+                videoElement.src = currentUrl;
+                videoElement.style.display = 'block';
+                placeholderElement.style.display = 'none';
+                videoConnected = true;
+                
+                // 开始监控视频流状态
+                startVideoMonitoring(videoElement, placeholderElement);
+                
+                console.log(`视频流连接成功: ${currentUrl}`);
+                
+                // 保存成功的IP到本地存储
+                localStorage.setItem('cameraIP', document.getElementById('cameraIP').value);
+            };
+            
+            testImg.onerror = function() {
+                // 连接失败，尝试下一个URL
+                console.log(`视频流连接失败: ${currentUrl}`);
+                tryConnectVideo(urls, index + 1, videoElement, placeholderElement);
+            };
+            
+            // 设置超时
+            setTimeout(() => {
+                if (!videoConnected) {
+                    testImg.src = '';
+                    tryConnectVideo(urls, index + 1, videoElement, placeholderElement);
+                }
+            }, 3000);
+            
+            testImg.src = currentUrl;
+        }
+        
+        function disconnectCamera() {
+            const videoStream = document.getElementById('videoStream');
+            const videoPlaceholder = document.getElementById('videoPlaceholder');
+            
+            videoStream.src = '';
+            videoStream.style.display = 'none';
+            videoPlaceholder.style.display = 'flex';
+            videoConnected = false;
+            
+            // 停止视频监控
+            if (videoCheckInterval) {
+                clearInterval(videoCheckInterval);
+                videoCheckInterval = null;
+            }
+            
+            console.log('视频流已断开');
+        }
+        
+        function startVideoMonitoring(videoElement, placeholderElement) {
+            // 清除之前的监控
+            if (videoCheckInterval) {
+                clearInterval(videoCheckInterval);
+            }
+            
+            // 每5秒检查一次视频流状态
+            videoCheckInterval = setInterval(() => {
+                if (videoConnected) {
+                    // 通过创建新的图片元素检查视频流是否仍然可用
+                    const testImg = new Image();
+                    testImg.onload = function() {
+                        // 视频流正常
+                    };
+                    testImg.onerror = function() {
+                        // 视频流断开，自动重连
+                        console.log('检测到视频流断开，尝试重连...');
+                        connectCamera();
+                    };
+                    testImg.src = videoElement.src + '?t=' + Date.now();
+                }
+            }, 5000);
+        }
+        
+        // 页面加载时恢复上次的摄像头IP
+        window.addEventListener('load', function() {
+            const savedIP = localStorage.getItem('cameraIP');
+            if (savedIP) {
+                document.getElementById('cameraIP').value = savedIP;
+            }
+        });
+        
         function sendCommand(action) {
-            fetch('/api?action=' + action)
+            // 使用新的RESTful API端点
+            const endpoint = `/api/${action}`;
+            fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            })
                 .then(response => response.json())
                 .then(data => {
                     console.log('Command response:', data);
@@ -650,18 +1296,79 @@ const char* webPage = R"HTML(
         function setSpeedPercent(value) {
             document.getElementById('speedValue').textContent = value;
             document.getElementById('speedPercent').textContent = value;
-            fetch('/api?action=speedpercent&value=' + value);
+            
+            // 使用新的RESTful API
+            fetch('/api/speed', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ value: parseInt(value) })
+            })
+                .then(response => response.json())
+                .then(data => console.log('Speed response:', data))
+                .catch(error => console.error('Speed error:', error));
         }
         
         function updateStatus() {
-            fetch('/api?action=distance')
+            // 使用新的RESTful API获取状态
+            fetch('/api/status')
                 .then(response => response.json())
                 .then(data => {
+                    console.log('Status response:', data); // 调试信息
+                    
+                    // 更新距离显示
                     if (data.distance !== undefined) {
-                        document.getElementById('distance').textContent = data.distance;
+                        const distanceElement = document.getElementById('distance');
+                        if (distanceElement) {
+                            console.log('更新距离显示:', data.distance); // 调试日志
+                            if (data.distance >= 999) {
+                                distanceElement.textContent = '--';
+                                distanceElement.style.color = '#ff4444';
+                                console.log('距离传感器错误，显示 --');
+                            } else {
+                                distanceElement.textContent = data.distance.toFixed(1);
+                                distanceElement.style.color = data.distance < data.safe_distance ? '#ff4444' : '#00ff00';
+                                console.log('距离更新成功:', data.distance.toFixed(1) + ' cm');
+                            }
+                        } else {
+                            console.error('找不到距离显示元素 #distance');
+                        }
+                    } else {
+                        console.error('API响应中缺少distance字段');
+                    }
+                    
+                    // 更新舵机角度显示
+                    if (data.servo_angle !== undefined) {
+                        const servoAngleElement = document.getElementById('servoAngle');
+                        if (servoAngleElement) {
+                            servoAngleElement.textContent = data.servo_angle.toFixed(1);
+                        }
+                        
+                        // 同步滑块位置
+                        const servoSlider = document.getElementById('servoSlider');
+                        if (servoSlider && Math.abs(servoSlider.value - data.servo_angle) > 1) {
+                            servoSlider.value = data.servo_angle;
+                        }
+                    }
+                    
+                    // 更新速度显示
+                    if (data.percent !== undefined) {
+                        const speedElement = document.getElementById('speedPercent');
+                        if (speedElement) {
+                            speedElement.textContent = data.percent;
+                        }
                     }
                 })
-                .catch(error => console.error('Error:', error));
+                .catch(error => {
+                    console.error('Status update error:', error);
+                    // 显示错误状态
+                    const distanceElement = document.getElementById('distance');
+                    if (distanceElement) {
+                        distanceElement.textContent = 'Offline';
+                        distanceElement.style.color = '#888888';
+                    }
+                });
         }
         
         // 定期更新状态
@@ -714,10 +1421,12 @@ const char* webPage = R"HTML(
         
         // 发送舵机控制命令到ESP32
         function sendServoCommand(angle) {
-            const url = `${ESP32_IP}/api?action=servo&value=${angle}`;
-            fetch(url, {
-                method: 'GET',
-                timeout: 3000 // 3秒超时
+            fetch('/api/servo', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ value: parseFloat(angle) })
             })
                 .then(response => {
                     if (!response.ok) {
@@ -912,7 +1621,61 @@ void setup() {
     request->send(200, "text/html", webPage);
   });
   
-  server.on("/api", HTTP_GET, handleWebAPI);
+  // 移除冲突的 /api 路由，因为它会拦截所有 /api/* 请求
+  // server.on("/api", HTTP_GET, handleWebAPI);  // 注释掉这行
+  
+  // RESTful API endpoints for car control
+  server.on("/api/forward", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "forward");
+  });
+  
+  server.on("/api/backward", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "backward");
+  });
+  
+  server.on("/api/left", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "left");
+  });
+  
+  server.on("/api/right", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "right");
+  });
+  
+  server.on("/api/leftShift", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "leftside");
+  });
+  
+  server.on("/api/rightShift", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "rightside");
+  });
+  
+  server.on("/api/leftTurn", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "rotateleft");
+  });
+  
+  server.on("/api/rightTurn", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "rotateright");
+  });
+  
+  server.on("/api/stop", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleCarMovement(request, "stop");
+  });
+  
+  // Speed control endpoint
+  server.on("/api/speed", HTTP_POST, [](AsyncWebServerRequest *request){
+    handleSpeedControl(request);
+  });
+  
+  // Servo control endpoint
+  server.on("/api/servo", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, 
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      handleServoControl(request, data, len, index, total);
+    });
+  
+  // Status endpoint
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    handleStatusRequest(request);
+  });
   
   // Enable CORS with comprehensive headers
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
@@ -920,8 +1683,45 @@ void setup() {
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
   DefaultHeaders::Instance().addHeader("Access-Control-Max-Age", "86400");
   
-  // Handle preflight OPTIONS requests
-  server.on("/api", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+  // Handle preflight OPTIONS requests for all API endpoints
+  // 移除冲突的 /api OPTIONS 路由
+  // server.on("/api", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+  //   request->send(200);
+  // });
+  server.on("/api/forward", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/backward", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/left", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/right", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/leftShift", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/rightShift", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/leftTurn", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/rightTurn", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/stop", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/speed", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/servo", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
+    request->send(200);
+  });
+  server.on("/api/status", HTTP_OPTIONS, [](AsyncWebServerRequest *request){
     request->send(200);
   });
   
