@@ -8,8 +8,8 @@
 #include "esp_task_wdt.h"  // Add watchdog timer header
 
 // WiFi Configuration
-const char* ssid = "CU_204";
-const char* password = "wj990518.";
+const char* ssid = "your_wifi_name";
+const char* password = "your_wifi_pssword";
 
 // Blinker Configuration
 // const char* auth = "88897b5b6069";
