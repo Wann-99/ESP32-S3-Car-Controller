@@ -1,0 +1,49 @@
+{
+  "name": "ESP32-S3 智能小车控制器",
+  "short_name": "ESP32小车",
+  "description": "ESP32-S3智能小车的游戏手柄式控制界面",
+  "start_url": "./gamepad_interface.html",
+  "display": "standalone",
+  "background_color": "#1a1a2e",
+  "theme_color": "#0f3460",
+  "orientation": "portrait",
+  "scope": "./",
+  "lang": "zh-CN",
+  "categories": ["utilities", "productivity"],
+  "icons": [
+    {
+      "src": "icon-192x192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "maskable any"
+    },
+    {
+      "src": "favicon.ico",
+      "sizes": "32x32",
+      "type": "image/x-icon"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "screenshot-mobile.png",
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "快速连接",
+      "short_name": "连接",
+      "description": "快速连接到ESP32设备",
+      "url": "./gamepad_interface.html?action=connect",
+      "icons": [
+        {
+          "src": "icon-192x192.svg",
+          "sizes": "192x192"
+        }
+      ]
+    }
+  ],
+  "prefer_related_applications": false
+}

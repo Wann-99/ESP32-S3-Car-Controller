@@ -1,0 +1,44 @@
+<svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+  <!-- 背景圆形 -->
+  <circle cx="96" cy="96" r="88" fill="#0f3460" stroke="#16213e" stroke-width="4"/>
+  
+  <!-- 小车主体 -->
+  <rect x="56" y="76" width="80" height="40" rx="8" fill="#2196F3" stroke="#1976D2" stroke-width="2"/>
+  
+  <!-- 车轮 -->
+  <circle cx="68" cy="124" r="12" fill="#424242" stroke="#212121" stroke-width="2"/>
+  <circle cx="124" cy="124" r="12" fill="#424242" stroke="#212121" stroke-width="2"/>
+  <circle cx="68" cy="68" r="12" fill="#424242" stroke="#212121" stroke-width="2"/>
+  <circle cx="124" cy="68" r="12" fill="#424242" stroke="#212121" stroke-width="2"/>
+  
+  <!-- 车轮内圈 -->
+  <circle cx="68" cy="124" r="6" fill="#616161"/>
+  <circle cx="124" cy="124" r="6" fill="#616161"/>
+  <circle cx="68" cy="68" r="6" fill="#616161"/>
+  <circle cx="124" cy="68" r="6" fill="#616161"/>
+  
+  <!-- 超声波传感器 -->
+  <rect x="84" y="60" width="24" height="8" rx="4" fill="#FF9800" stroke="#F57C00" stroke-width="1"/>
+  <circle cx="90" cy="64" r="2" fill="#FFF"/>
+  <circle cx="102" cy="64" r="2" fill="#FFF"/>
+  
+  <!-- 摄像头 -->
+  <circle cx="96" cy="84" r="8" fill="#333" stroke="#000" stroke-width="1"/>
+  <circle cx="96" cy="84" r="4" fill="#1976D2"/>
+  
+  <!-- ESP32标识 -->
+  <text x="96" y="108" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#FFF">ESP32</text>
+  
+  <!-- 控制信号线 -->
+  <path d="M 76 96 Q 86 86 96 96 Q 106 106 116 96" stroke="#4CAF50" stroke-width="2" fill="none"/>
+  
+  <!-- 装饰性边框 -->
+  <circle cx="96" cy="96" r="88" fill="none" stroke="url(#gradient)" stroke-width="2"/>
+  
+  <defs>
+    <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#64B5F6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1976D2;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+</svg>

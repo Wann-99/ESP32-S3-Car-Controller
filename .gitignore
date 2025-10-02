@@ -1,0 +1,39 @@
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+
+# Arduino编译文件
+*.hex
+*.bin
+*.elf
+
+# 备份文件
+*.bak
+*.backup
+
+# 缓存文件
+node_modules/
+.cache/
+dist/
+
+# 环境配置
+.env
+.env.local
+.env.production
+
+# 部署文件
+.vercel/
+.netlify/
