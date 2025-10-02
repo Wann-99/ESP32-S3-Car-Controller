@@ -604,7 +604,8 @@
                     </div>
                     <div class="control-group">
                         <input type="text" class="ip-input" id="esp32IPInput" placeholder="ESP32 IP" value="192.168.1.100">
-                        <button class="connect-btn" onclick="setESP32IP()">连接ESP32</button>
+                        <button class="connect-btn" onclick="saveESP32IP()">连接ESP32</button>
+                        <button class="connect-btn" onclick="reconnectESP32()" style="background: #ff9800;">重连</button>
                     </div>
                 </div>
             </div>
@@ -628,6 +629,8 @@
                             onmousedown="startMovement('forward')" 
                             onmouseup="stopMovement()" 
                             onmouseleave="stopMovement()"
+                            ontouchstart="startMovement('forward')" 
+                            ontouchend="stopMovement()"
                             title="前进">
                         ↑
                     </button>
@@ -635,6 +638,8 @@
                             onmousedown="startMovement('left')" 
                             onmouseup="stopMovement()" 
                             onmouseleave="stopMovement()"
+                            ontouchstart="startMovement('left')" 
+                            ontouchend="stopMovement()"
                             title="左转">
                         ←
                     </button>
@@ -647,6 +652,8 @@
                             onmousedown="startMovement('right')" 
                             onmouseup="stopMovement()" 
                             onmouseleave="stopMovement()"
+                            ontouchstart="startMovement('right')" 
+                            ontouchend="stopMovement()"
                             title="右转">
                         →
                     </button>
@@ -654,6 +661,8 @@
                             onmousedown="startMovement('backward')" 
                             onmouseup="stopMovement()" 
                             onmouseleave="stopMovement()"
+                            ontouchstart="startMovement('backward')" 
+                            ontouchend="stopMovement()"
                             title="后退">
                         ↓
                     </button>
@@ -693,6 +702,8 @@
                             onmousedown="startMovement('leftside')" 
                             onmouseup="stopMovement()" 
                             onmouseleave="stopMovement()"
+                            ontouchstart="startMovement('leftside')" 
+                            ontouchend="stopMovement()"
                             title="麦轮左平移">
                         ⬅ 左平移
                     </button>
@@ -700,6 +711,8 @@
                             onmousedown="startMovement('rightside')" 
                             onmouseup="stopMovement()" 
                             onmouseleave="stopMovement()"
+                            ontouchstart="startMovement('rightside')" 
+                            ontouchend="stopMovement()"
                             title="麦轮右平移">
                         ➡ 右平移
                     </button>
@@ -707,6 +720,8 @@
                             onmousedown="startMovement('rotateleft')" 
                             onmouseup="stopMovement()" 
                             onmouseleave="stopMovement()"
+                            ontouchstart="startMovement('rotateleft')" 
+                            ontouchend="stopMovement()"
                             title="左掉头">
                         ↺ 左掉头
                     </button>
@@ -714,6 +729,8 @@
                             onmousedown="startMovement('rotateright')" 
                             onmouseup="stopMovement()" 
                             onmouseleave="stopMovement()"
+                            ontouchstart="startMovement('rotateright')" 
+                            ontouchend="stopMovement()"
                             title="右掉头">
                         ↻ 右掉头
                     </button>
@@ -757,6 +774,14 @@
         let currentMovement = null;
         let movementInterval = null;
         let videoStream = null;
+        
+        // 优化控制变量
+        let commandQueue = [];
+        let isProcessingCommand = false;
+        let lastServoCommand = 0;
+        let servoDebounceTimer = null;
+        let connectionCheckInterval = null;
+        let lastConnectionCheck = 0;
 
         // ESP32 连接管理
         function setESP32IP() {
@@ -797,6 +822,19 @@
                 document.getElementById('esp32IP').textContent = savedIP;
             }
         }
+        
+        // 手动重连功能
+        function reconnectESP32() {
+            isConnected = false;
+            lastConnectionCheck = 0;
+            commandQueue = [];
+            isProcessingCommand = false;
+            
+            document.getElementById('connectionStatus').textContent = '重连中...';
+            showNotification('正在重新连接ESP32...', 'info');
+            
+            setTimeout(checkConnection, 1000);
+        }
 
         // 显示通知消息
         function showNotification(message, type = 'info') {
@@ -830,22 +868,37 @@
             }, 3000);
         }
 
-        // 检查连接状态
+        // 优化的连接状态检查
         async function checkConnection() {
+            const now = Date.now();
+            // 避免频繁检查，至少间隔3秒
+            if (now - lastConnectionCheck < 3000) {
+                return;
+            }
+            lastConnectionCheck = now;
+            
             const status = document.getElementById('connectionStatus');
             
-            status.textContent = '检查中';
-
             try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+                
                 const response = await fetch(`http://${esp32IP}/api?action=status`, {
                     method: 'GET',
-                    timeout: 3000
+                    signal: controller.signal
                 });
+                
+                clearTimeout(timeoutId);
                 
                 if (response.ok) {
                     const data = await response.json();
-                    isConnected = true;
-                    status.textContent = '已连接';
+                    if (!isConnected) {
+                        isConnected = true;
+                        status.textContent = '已连接';
+                        showNotification('✅ ESP32连接成功', 'success');
+                    } else {
+                        status.textContent = '已连接';
+                    }
                     
                     // 更新距离显示
                     if (data.distance !== undefined) {
@@ -855,26 +908,57 @@
                     throw new Error('连接失败');
                 }
             } catch (error) {
-                isConnected = false;
-                status.textContent = '连接失败';
-                document.getElementById('distanceValue').textContent = '-- cm';
+                if (isConnected) {
+                    isConnected = false;
+                    status.textContent = '连接失败';
+                    document.getElementById('distanceValue').textContent = '-- cm';
+                    showNotification('❌ ESP32连接断开', 'error');
+                } else {
+                    status.textContent = '连接失败';
+                }
             }
         }
 
-        // 发送命令到ESP32
+        // 优化的命令发送函数
         async function sendCommand(action, value = '') {
             if (!isConnected) {
                 console.log('ESP32未连接，无法发送命令');
                 return;
             }
 
+            // 添加到命令队列
+            const command = { action, value, timestamp: Date.now() };
+            commandQueue.push(command);
+            
+            // 处理命令队列
+            processCommandQueue();
+        }
+        
+        // 处理命令队列
+        async function processCommandQueue() {
+            if (isProcessingCommand || commandQueue.length === 0) {
+                return;
+            }
+            
+            isProcessingCommand = true;
+            const command = commandQueue.shift();
+            
             try {
-                let url = `http://${esp32IP}/api?action=${action}`;
-                if (value !== '') {
-                    url += `&value=${value}`;
+                let url = `http://${esp32IP}/api?action=${command.action}`;
+                if (command.value !== '') {
+                    url += `&value=${command.value}`;
                 }
                 
-                const response = await fetch(url, { method: 'GET' });
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+                
+                const response = await fetch(url, { 
+                    method: 'GET',
+                    signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                
                 if (response.ok) {
                     const data = await response.json();
                     console.log('命令执行成功:', data);
@@ -884,10 +968,24 @@
                         document.getElementById('distanceValue').textContent = data.distance + ' cm';
                     }
                     
+                    isProcessingCommand = false;
+                    // 继续处理队列中的下一个命令
+                    setTimeout(processCommandQueue, 50);
                     return data;
+                } else {
+                    throw new Error(`HTTP ${response.status}`);
                 }
             } catch (error) {
                 console.error('发送命令失败:', error);
+                if (error.name === 'AbortError') {
+                    console.log('命令超时');
+                }
+            } finally {
+                isProcessingCommand = false;
+                // 即使出错也要继续处理队列
+                if (commandQueue.length > 0) {
+                    setTimeout(processCommandQueue, 100);
+                }
             }
         }
 
@@ -901,7 +999,7 @@
             // 立即发送命令
             sendCommand(action);
             
-            // 设置持续发送
+            // 设置持续发送，降低频率以减少ESP32负担
             if (movementInterval) {
                 clearInterval(movementInterval);
             }
@@ -909,7 +1007,7 @@
                 if (currentMovement === action) {
                     sendCommand(action);
                 }
-            }, 100);
+            }, 200); // 从100ms改为200ms
         }
 
         // 停止移动
@@ -940,11 +1038,11 @@
             return actionNames[action] || action;
         }
 
-        // 设置舵机角度
+        // 设置舵机角度（带防抖动）
         function setServo(angle) {
             angle = Math.max(0, Math.min(180, parseFloat(angle)));
             
-            document.getElementById('servoAngle').textContent = angle;
+            document.getElementById('servoAngle').textContent = Math.round(angle);
             document.getElementById('servoSlider').value = angle;
             
             // 更新舵机指针显示
@@ -952,7 +1050,18 @@
             const rotation = (angle - 90); // 以90度为中心
             needle.style.transform = `translate(-50%, -100%) rotate(${rotation}deg)`;
             
-            sendCommand('servo', angle);
+            // 防抖动处理
+            if (servoDebounceTimer) {
+                clearTimeout(servoDebounceTimer);
+            }
+            
+            servoDebounceTimer = setTimeout(() => {
+                // 避免发送重复命令
+                if (Math.abs(angle - lastServoCommand) > 1) {
+                    sendCommand('servo', Math.round(angle));
+                    lastServoCommand = angle;
+                }
+            }, 100);
         }
 
         // 设置速度百分比
@@ -1197,8 +1306,8 @@
             // 检查连接状态
             checkConnection();
             
-            // 定期检查连接状态
-            setInterval(checkConnection, 5000);
+            // 定期检查连接状态，降低频率
+            connectionCheckInterval = setInterval(checkConnection, 8000);
             
             // 设置默认ESP32 IP显示
             document.getElementById('esp32IP').textContent = esp32IP;
@@ -1209,8 +1318,28 @@
             if (movementInterval) {
                 clearInterval(movementInterval);
             }
+            if (connectionCheckInterval) {
+                clearInterval(connectionCheckInterval);
+            }
+            if (servoDebounceTimer) {
+                clearTimeout(servoDebounceTimer);
+            }
             sendCommand('stop');
         });
+        
+        // 添加触摸事件处理
+        document.addEventListener('touchstart', function(e) {
+            // 防止触摸时的默认行为
+            if (e.target.classList.contains('dpad-btn') || e.target.classList.contains('advanced-btn')) {
+                e.preventDefault();
+            }
+        }, { passive: false });
+        
+        document.addEventListener('touchend', function(e) {
+            if (e.target.classList.contains('dpad-btn') || e.target.classList.contains('advanced-btn')) {
+                e.preventDefault();
+            }
+        }, { passive: false });
     </script>
 </body>
 </html>
