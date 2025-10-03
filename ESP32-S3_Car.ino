@@ -1,18 +1,40 @@
 // Blinker mode definition (must be before including Blinker.h)
-// #define BLINKER_WIFI
+#define BLINKER_WIFI
+#define BLINKER_PRINT Serial
 
 #include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-// #include <Blinker.h>
+#include <WiFiManager.h>   // WiFi配网管理库
+#include <Preferences.h>   // ESP32 NVS存储库
+#include <Blinker.h>
 #include "driver/ledc.h"
 #include "esp_task_wdt.h"  // Add watchdog timer header
+#include "esp_wifi.h"      // Add WiFi advanced control
 
-// WiFi Configuration
-const char* ssid = "your_wifi_name";
-const char* password = "your_wifi_pssword";
+// WiFi Configuration (使用WiFiManager进行配网)
+// const char* ssid = "CU_204";        // 注释掉硬编码的WiFi配置
+// const char* password = "wj990518."; // 注释掉硬编码的WiFi配置
+
+// WiFiManager实例
+WiFiManager wifiManager;
+Preferences preferences;
 
 // Blinker Configuration
-// const char* auth = "88897b5b6069";
+const char* auth = "88897b5b6069";  // 请替换为您的Blinker设备密钥
+
+// WiFi配网相关变量
+bool shouldSaveConfig = false;
+bool wifiConfigMode = false;
+const int CONFIG_BUTTON_PIN = 0;  // 使用Boot按钮作为配网按钮
+
+// Network optimization variables
+unsigned long lastWiFiCheck = 0;
+unsigned long lastBlinkerUpdate = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 10000;    // Check WiFi every 10 seconds
+const unsigned long BLINKER_UPDATE_INTERVAL = 500;  // Update Blinker every 500ms (reduced from frequent updates)
+int wifiReconnectAttempts = 0;
+const int MAX_WIFI_RECONNECT_ATTEMPTS = 3;
+bool networkStable = false;
+int lastRSSI = 0;
 
 // ESP32-S3 optimized pin definitions (avoid internal conflict pins)
 #define MOTOR_IN1         1   // GPIO1 - Left motor direction 1
@@ -25,7 +47,7 @@ const char* password = "your_wifi_pssword";
 #define ULTRASONIC_ECHO   5   // GPIO5 - Ultrasonic echo
 #define SERVO_PIN         6   // GPIO6 - Servo control (PWM)
 #define LED_PIN           48  // GPIO48 - Status LED
-#define BUZZER_PIN        7   // GPIO7 - Buzzer
+// #define BUZZER_PIN        7   // GPIO7 - Buzzer
 
 // Global variables
 int motorSpeed = 200;        // Motor speed (50-255)
@@ -34,20 +56,95 @@ unsigned long lastWebUpdate = 0;
 unsigned long lastDistanceCheck = 0;
 const float SAFE_DISTANCE = 10.0;  // Reduced safe distance from 15cm to 10cm for better mobility
 
-// Blinker button definitions
-/*
-BlinkerButton ButtonF("btn-f");
-BlinkerButton ButtonB("btn-b");
-BlinkerButton ButtonL("btn-l");
-BlinkerButton ButtonR("btn-r");
-BlinkerButton ButtonS("btn-s");
-BlinkerButton ButtonAuto("btn-auto");
-BlinkerSlider SliderSpeed("slider-speed");
-BlinkerNumber NumberDistance("distance");
-*/
+// Sensor optimization variables
+float cachedDistance = 999.0;
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_READ_INTERVAL = 200;  // Read sensor every 200ms instead of every call
 
-// Web server
-AsyncWebServer server(80);
+// Blinker button definitions
+BlinkerButton ButtonF("btn-f");      // 前进按钮
+BlinkerButton ButtonB("btn-b");      // 后退按钮
+BlinkerButton ButtonL("btn-l");      // 左转按钮
+BlinkerButton ButtonR("btn-r");      // 右转按钮
+// BlinkerButton ButtonS("btn-s");      // 停止按钮 - 已移除
+// BlinkerButton ButtonAuto("btn-auto"); // 自动模式按钮 - 已移除
+BlinkerSlider SliderSpeed("slider-speed"); // 速度滑块
+BlinkerSlider SliderServo("slider-servo"); // 舵机角度滑块
+BlinkerNumber NumberDistance("distance");  // 距离显示
+BlinkerNumber NumberSpeed("speed");        // 速度显示
+BlinkerText TextIP("ip");                  // IP地址显示
+
+// Web server (commented out due to AsyncTCP conflict with Blinker)
+// AsyncWebServer server(80);
+
+// WiFi management functions for network stability
+bool checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    // Serial.println("WiFi disconnected, attempting reconnection...");
+    networkStable = false;
+    return false;
+  }
+  
+  // Check signal strength
+  int currentRSSI = WiFi.RSSI();
+  if (currentRSSI != lastRSSI) {
+    // Serial.printf("WiFi RSSI: %d dBm\n", currentRSSI);
+    lastRSSI = currentRSSI;
+  }
+  
+  // Consider connection unstable if signal is very weak
+  if (currentRSSI < -80) {
+    // Serial.println("Warning: Weak WiFi signal detected");
+    networkStable = false;
+  } else {
+    networkStable = true;
+  }
+  
+  return true;
+}
+
+void reconnectWiFi() {
+  if (wifiReconnectAttempts >= MAX_WIFI_RECONNECT_ATTEMPTS) {
+    Serial.println("Max WiFi reconnection attempts reached, restarting system...");
+    systemRestart("WiFi connection failed");
+    return;
+  }
+  
+  wifiReconnectAttempts++;
+  // Serial.printf("WiFi reconnection attempt %d/%d\n", wifiReconnectAttempts, MAX_WIFI_RECONNECT_ATTEMPTS);
+  
+  // 使用WiFiManager重新连接
+  WiFi.disconnect();
+  delay(1000);
+  
+  // 尝试使用保存的凭据重新连接
+  preferences.begin("wifi-config", true);
+  String savedSSID = preferences.getString("ssid", "");
+  String savedPassword = preferences.getString("password", "");
+  preferences.end();
+  
+  if (savedSSID.length() > 0 && savedPassword.length() > 0) {
+    WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+    
+    // Wait for connection with timeout
+    int timeout = 0;
+    while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+      delay(500);
+      // Serial.print(".");
+      timeout++;
+      esp_task_wdt_reset();
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    // Serial.println("\nWiFi reconnected successfully!");
+    wifiReconnectAttempts = 0;  // Reset counter on successful connection
+    networkStable = true;
+  } else {
+    // Serial.println("\nWiFi reconnection failed");
+    networkStable = false;
+  }
+}
 
 // System restart function
 void systemRestart(const char* reason) {
@@ -64,32 +161,39 @@ void setLED(bool state) {
 }
 
 // Buzzer control
-void beep(int duration = 100) {
-  digitalWrite(BUZZER_PIN, HIGH);
-  delay(duration);
-  digitalWrite(BUZZER_PIN, LOW);
-}
+// void beep(int duration = 100) {
+//   digitalWrite(BUZZER_PIN, HIGH);
+//   delay(duration);
+//   digitalWrite(BUZZER_PIN, LOW);
+// }
 
 // Enhanced motor control functions with safety check
 bool checkSafeToMoveForward() {
   float distance = getDistance();
   
   // Add debug output to help diagnose the issue
-  Serial.print("Distance reading: ");
-  Serial.print(distance);
-  Serial.print(" cm, Safe distance: ");
-  Serial.print(SAFE_DISTANCE);
-  Serial.println(" cm");
+  // Serial.print("Distance reading: ");
+  // Serial.print(distance);
+  // Serial.print(" cm, Safe distance: ");
+  // Serial.print(SAFE_DISTANCE);
+  // Serial.println(" cm");
   
   // Check for invalid readings (999.0 indicates sensor error)
   if (distance >= 999.0) {
-    Serial.println("Warning: Invalid distance reading, allowing movement");
+    // Serial.println("Warning: Invalid distance reading, allowing movement");
     return true;  // Allow movement if sensor reading is invalid
   }
   
   bool isSafe = distance > SAFE_DISTANCE;
+  // Serial.printf("Safety check: %.2f > %.2f = %s\n", 
+  //   distance, SAFE_DISTANCE, isSafe ? "SAFE" : "BLOCKED");
+  
   if (!isSafe) {
-    Serial.println("Movement blocked by obstacle");
+    // Serial.printf("Movement BLOCKED: obstacle at %.2f cm (< %.2f cm safe distance)\n", 
+    //   distance, SAFE_DISTANCE);
+  } else {
+    // Serial.printf("Movement ALLOWED: clear path at %.2f cm (> %.2f cm safe distance)\n", 
+    //   distance, SAFE_DISTANCE);
   }
   
   return isSafe;
@@ -97,41 +201,51 @@ bool checkSafeToMoveForward() {
 
 // Motor control functions (performance optimized)
 void setMotorSpeed(int leftSpeed, int rightSpeed) {
+  // Serial.printf("=== setMotorSpeed called: left=%d, right=%d ===\n", leftSpeed, rightSpeed);
+  
   // Batch set GPIO status to reduce function call overhead
   digitalWrite(MOTOR_IN1, leftSpeed > 0 ? HIGH : LOW);
   digitalWrite(MOTOR_IN2, leftSpeed > 0 ? LOW : HIGH);
   digitalWrite(MOTOR_IN3, rightSpeed > 0 ? HIGH : LOW);
   digitalWrite(MOTOR_IN4, rightSpeed > 0 ? LOW : HIGH);
   
+  // Serial.printf("GPIO states - IN1:%d, IN2:%d, IN3:%d, IN4:%d\n", 
+  //   leftSpeed > 0 ? 1 : 0, leftSpeed > 0 ? 0 : 1,
+  //   rightSpeed > 0 ? 1 : 0, rightSpeed > 0 ? 0 : 1);
+  
   // Use ESP32-S3 high-speed PWM
   ledcWrite(0, abs(leftSpeed));   // ENA: PWM channel 0
   ledcWrite(1, abs(rightSpeed));  // ENB: PWM channel 1
+  
+  // Serial.printf("PWM values - Channel 0 (ENA): %d, Channel 1 (ENB): %d\n", 
+  //   abs(leftSpeed), abs(rightSpeed));
 }
 
 // Motor direction control with safety check
 void moveForward() {
+  // Serial.println("=== moveForward() called ===");
   if (!checkSafeToMoveForward()) {
-    Serial.println("Forward blocked - obstacle detected");
-    beep(100);
+    // Serial.println("Forward blocked - obstacle detected");
+    //beep(100);
     return;
   }
   setMotorSpeed(motorSpeed, motorSpeed);
-  Serial.println("Forward");
+  // Serial.printf("Forward - Motor speed: %d\n", motorSpeed);
 }
 
 void moveBackward() {
   setMotorSpeed(-motorSpeed, -motorSpeed);
-  Serial.println("Backward");
+  // Serial.println("Backward");
 }
 
 void turnLeft() {
   setMotorSpeed(motorSpeed, -motorSpeed);
-  Serial.println("Turn Left");
+  // Serial.println("Turn Left");
 }
 
 void turnRight() {
   setMotorSpeed(-motorSpeed, motorSpeed);
-  Serial.println("Turn Right");
+  // Serial.println("Turn Right");
 }
 
 // Mecanum wheel strafe movement functions (left/right side movement)
@@ -139,53 +253,65 @@ void moveLeftSide() {
   // Mecanum wheel left strafe: 
   // Front-left and rear-right wheels forward, front-right and rear-left wheels backward
   setMotorSpeed(-motorSpeed, motorSpeed);
-  Serial.println("Mecanum Strafe Left");
+  // Serial.println("Mecanum Strafe Left");
 }
 
 void moveRightSide() {
   // Mecanum wheel right strafe:
   // Front-right and rear-left wheels forward, front-left and rear-right wheels backward  
   setMotorSpeed(motorSpeed, -motorSpeed);
-  Serial.println("Mecanum Strafe Right");
+  // Serial.println("Mecanum Strafe Right");
 }
 
-// In-place rotation functions - 180 degree turn
+// In-place rotation functions - 180 degree turn (optimized for non-blocking)
 void rotateLeft() {
   setMotorSpeed(-motorSpeed, motorSpeed);
-  Serial.println("Rotate Left 180° (In-place)");
+  // Serial.println("Rotate Left 180° (In-place)");
   
   // Calculate rotation time based on speed
   // Approximate time for 180° rotation (adjust based on testing)
   int rotationTime = map(motorSpeed, 51, 255, 2000, 1000); // 1-2 seconds based on speed
   
-  delay(rotationTime);
+  // Non-blocking delay with watchdog reset
+  unsigned long startTime = millis();
+  while (millis() - startTime < rotationTime) {
+    esp_task_wdt_reset();  // Reset watchdog during rotation
+    delay(10);  // Small delay to prevent tight loop
+  }
+  
   stopMotors();
-  Serial.println("Left 180° rotation completed");
+  // Serial.println("Left 180° rotation completed");
 }
 
 void rotateRight() {
   setMotorSpeed(motorSpeed, -motorSpeed);
-  Serial.println("Rotate Right 180° (In-place)");
+  // Serial.println("Rotate Right 180° (In-place)");
   
   // Calculate rotation time based on speed
   // Approximate time for 180° rotation (adjust based on testing)
   int rotationTime = map(motorSpeed, 51, 255, 2000, 1000); // 1-2 seconds based on speed
   
-  delay(rotationTime);
+  // Non-blocking delay with watchdog reset
+  unsigned long startTime = millis();
+  while (millis() - startTime < rotationTime) {
+    esp_task_wdt_reset();  // Reset watchdog during rotation
+    delay(10);  // Small delay to prevent tight loop
+  }
+  
   stopMotors();
-  Serial.println("Right 180° rotation completed");
+  // Serial.println("Right 180° rotation completed");
 }
 
 void stopMotors() {
   setMotorSpeed(0, 0);
-  Serial.println("Stop");
+  // Serial.println("Stop");
 }
 
 // Speed control functions
 void setSpeedPercent(int percent) {
-  speedPercent = constrain(percent, 20, 100);
-  motorSpeed = map(speedPercent, 20, 100, 51, 255);
-  Serial.printf("Speed set to %d%% (%d/255)\n", speedPercent, motorSpeed);
+  speedPercent = constrain(percent, 0, 100);
+  motorSpeed = map(speedPercent, 0, 100, 0, 255);
+  // Serial.printf("Speed set to %d%% (%d/255)\n", speedPercent, motorSpeed);
 }
 
 // Enhanced ultrasonic distance measurement with high precision algorithm
@@ -200,57 +326,102 @@ unsigned long Len_Integer = 0; //
 unsigned int Len_Fraction = 0;
 
 float getDistance() {
-  Serial.println("=== 开始超声波测距 ===");
+  // Use cached distance if recent reading is available
+  unsigned long currentTime = millis();
+  if (currentTime - lastSensorRead < SENSOR_READ_INTERVAL && cachedDistance < 999.0) {
+    // Serial.printf("Using cached distance: %.2fcm (age: %lums)\n", 
+    //               cachedDistance, currentTime - lastSensorRead);
+    return cachedDistance;
+  }
+  
+  // Serial.println("=== 开始超声波测距 ===");
+  
+  // 确保引脚状态正确
+  pinMode(ULTRASONIC_TRIG, OUTPUT);
+  pinMode(ULTRASONIC_ECHO, INPUT);
   
   // 触发超声波脉冲 (严格按照HC-SR04时序)
   digitalWrite(ULTRASONIC_TRIG, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(5);  // 增加稳定时间
   digitalWrite(ULTRASONIC_TRIG, HIGH);
   delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG, LOW);
   
-  Serial.println("触发脉冲已发送");
+  // Serial.println("触发脉冲已发送");
+  // Serial.printf("TRIG引脚状态: %d, ECHO引脚状态: %d\n", 
+  //               digitalRead(ULTRASONIC_TRIG), digitalRead(ULTRASONIC_ECHO));
   
-  // 测量回波时间，设置60ms超时（对应约10米最大距离）
-  Time_Echo_us = pulseIn(ULTRASONIC_ECHO, HIGH, 60000);
+  // 测量回波时间，设置30ms超时（对应约5米最大距离）
+  Time_Echo_us = pulseIn(ULTRASONIC_ECHO, HIGH, 30000);
   
-  Serial.print("回波时间: ");
-  Serial.print(Time_Echo_us);
-  Serial.println(" 微秒");
+  // Serial.print("回波时间: ");
+  // Serial.print(Time_Echo_us);
+  // Serial.println(" 微秒");
   
-  // 严格的超时和有效性检测 (参考HC-SR04例程)
-  if (Time_Echo_us == 0 || Time_Echo_us < 1 || Time_Echo_us > 60000) {
-    Serial.println("超声波测距失败: 超时或无效读数");
-    return 999.0; // 返回最大值表示超出范围或错误
+  // 详细的调试信息
+  if (Time_Echo_us == 0) {
+    // Serial.println("❌ 超声波测距失败: 完全超时，可能是硬件连接问题");
+    // Serial.println("请检查:");
+    // Serial.println("1. TRIG引脚(GPIO4)连接是否正常");
+    // Serial.println("2. ECHO引脚(GPIO5)连接是否正常");
+    // Serial.println("3. 传感器电源是否为5V");
+    // Serial.println("4. 传感器前方是否有障碍物");
+    return 999.0;
   }
   
-  // HC-SR04超声波距离计算 (完全按照例程公式)
-  // 距离(mm) = Time_Echo_us * 34 / 2 / 100 (转换为cm)
-  // 为保持精度，使用X100计算
-  if ((Time_Echo_us < 60000) && (Time_Echo_us > 1)) {
+  if (Time_Echo_us > 30000) {
+    // Serial.printf("❌ 回波时间过长: %d微秒 (>30ms)\n", Time_Echo_us);
+    // Serial.println("可能原因: 没有障碍物反射或传感器故障");
+    return 999.0;
+  }
+  
+  if (Time_Echo_us < 150) {  // 约2.5cm对应的最小时间
+    // Serial.printf("❌ 回波时间过短: %d微秒 (<150μs)\n", Time_Echo_us);
+    // Serial.println("可能原因: 传感器过近或信号干扰");
+    return 999.0;
+  }
+  
+  // HC-SR04超声波距离计算
+  if ((Time_Echo_us < 30000) && (Time_Echo_us > 150)) {
     Len_mm_X100 = (Time_Echo_us * 34) / 2;
     Len_Integer = Len_mm_X100 / 100;
     Len_Fraction = Len_mm_X100 % 100;
     
-    Serial.print("Present Length is: ");
-    Serial.print(Len_Integer, DEC);
-    Serial.print(".");
-    if (Len_Fraction < 10) {
-      Serial.print("0");
-    }
-    Serial.print(Len_Fraction, DEC);
-    Serial.println("mm");
+    // Serial.print("Present Length is: ");
+    // Serial.print(Len_Integer, DEC);
+    // Serial.print(".");
+    // if (Len_Fraction < 10) {
+    //   Serial.print("0");
+    // }
+    // Serial.print(Len_Fraction, DEC);
+    // Serial.println("mm");
     
     // 转换为cm并返回
     float distance_cm = Len_Integer / 10.0 + Len_Fraction / 1000.0;
     
     // 范围检查 (2cm - 400cm)
-    if (distance_cm < 2.0 || distance_cm > 400.0) {
+    if (distance_cm < 2.0) {
+      // Serial.printf("❌ 距离过近: %.2fcm (<2cm)\n", distance_cm);
+      return 999.0;
+    }
+    if (distance_cm > 400.0) {
+      // Serial.printf("❌ 距离过远: %.2fcm (>400cm)\n", distance_cm);
       return 999.0;
     }
     
+    // Serial.printf("✅ 测距成功: %.2fcm\n", distance_cm);
+    
+    // Update cache
+    cachedDistance = distance_cm;
+    lastSensorRead = millis();
+    
     return distance_cm;
   }
+  
+  // Serial.println("❌ 未知错误");
+  
+  // Don't cache error values, but update timestamp to prevent rapid retries
+  lastSensorRead = millis();
   
   return 999.0; // 测量失败
 }
@@ -288,26 +459,26 @@ void setServoAngle(float angle) {
   currentServoAngle = angle;
   servoActive = true;
   
-  // 发送精确控制脉冲序列
-  for (int i = 0; i < 10; i++) {  // 增加脉冲数量确保精确定位
+  // 优化脉冲序列 - 减少阻塞时间
+  for (int i = 0; i < 5; i++) {  // 减少脉冲数量从10到5
     servopulse(angle);
     delay(20);  // 20ms间隔
     esp_task_wdt_reset();  // 重置看门狗
   }
   
-  // 添加稳定延时
-  delay(100);
+  // 减少稳定延时
+  delay(50);  // 从100ms减少到50ms
   
-  Serial.print("Present Length is: ");
-  Serial.print(angle, 2);
-  Serial.println(" degrees");
+  // Serial.print("Present angle is: ");
+  // Serial.print(angle, 2);
+  // Serial.println(" degrees");
 }
 
 // 停止舵机PWM信号
 void stopServo() {
   digitalWrite(SERVO_PIN, LOW);
   servoActive = false;
-  Serial.println("Servo stopped");
+  // Serial.println("Servo stopped");
 }
 
 // Automatic obstacle avoidance logic
@@ -372,7 +543,8 @@ void sliderSpeedCallback(int32_t value) {
 }
 */
 
-// Optimized Web API handling
+/*
+// Optimized Web API handling (commented out due to AsyncTCP conflict with Blinker)
 void handleWebAPI(AsyncWebServerRequest *request) {
   // 添加看门狗重置，防止处理时间过长
   esp_task_wdt_reset();
@@ -611,10 +783,10 @@ void handleServoControl(AsyncWebServerRequest *request, uint8_t *data, size_t le
 void handleStatusRequest(AsyncWebServerRequest *request) {
   esp_task_wdt_reset();
   
-  Serial.println("=== 处理状态请求 ===");
+  // Serial.println("=== 处理状态请求 ===");
   float distance = getDistance();
-  Serial.print("获取到的距离: ");
-  Serial.println(distance);
+  // Serial.print("获取到的距离: ");
+  // Serial.println(distance);
   
   static char response[400];
   
@@ -643,8 +815,10 @@ void handleStatusRequest(AsyncWebServerRequest *request) {
   Serial.println(response);
   request->send(200, "application/json", response);
 }
+*/
 
-// Optimized Web control page
+/*
+// Optimized Web control page (commented out due to AsyncTCP conflict with Blinker)
 const char* webPage = R"HTML(
 <!DOCTYPE html>
 <html>
@@ -1556,10 +1730,318 @@ const char* webPage = R"HTML(
 </body>
 </html>
 )HTML";
+*/
+
+// Blinker回调函数定义
+void buttonFCallback(const String & state) {
+  BLINKER_LOG("收到前进按钮: ", state);
+  // Serial.printf("=== buttonFCallback called with state: %s ===\n", state.c_str());
+  
+  if (state == BLINKER_CMD_ON) {
+    // 按下时开始前进
+    // Serial.println("Button pressed - starting forward movement");
+    moveForward();
+  } else if (state == BLINKER_CMD_OFF) {
+    // 松开时停止
+    // Serial.println("Button released - stopping motors");
+    stopMotors();
+  } else if (state == BLINKER_CMD_BUTTON_PRESSED) {
+    // 长按开始 - 开始前进
+    // Serial.println("Button long pressed - starting forward movement");
+    moveForward();
+  } else if (state == BLINKER_CMD_BUTTON_RELEASED) {
+    // 长按释放 - 停止
+    // Serial.println("Button long released - stopping motors");
+    stopMotors();
+  } else if (state == "tap" || state == BLINKER_CMD_BUTTON_TAP) {
+    // 处理点击事件 - 短暂前进
+    // Serial.println("Button tapped - brief forward movement");
+    moveForward();
+    delay(200);  // 短暂移动200ms
+    stopMotors();
+    // Serial.println("Brief forward movement completed");
+  }
+}
+
+void buttonBCallback(const String & state) {
+  BLINKER_LOG("收到后退按钮: ", state);
+  // Serial.printf("=== buttonBCallback called with state: %s ===\n", state.c_str());
+  
+  if (state == BLINKER_CMD_ON) {
+    // 按下时开始后退
+    // Serial.println("Button pressed - starting backward movement");
+    moveBackward();
+  } else if (state == BLINKER_CMD_OFF) {
+    // 松开时停止
+    // Serial.println("Button released - stopping motors");
+    stopMotors();
+  } else if (state == BLINKER_CMD_BUTTON_PRESSED) {
+    // 长按开始 - 开始后退
+    // Serial.println("Button long pressed - starting backward movement");
+    moveBackward();
+  } else if (state == BLINKER_CMD_BUTTON_RELEASED) {
+    // 长按释放 - 停止
+    // Serial.println("Button long released - stopping motors");
+    stopMotors();
+  } else if (state == "tap" || state == BLINKER_CMD_BUTTON_TAP) {
+    // 处理点击事件 - 短暂后退
+    // Serial.println("Button tapped - brief backward movement");
+    moveBackward();
+    delay(200);  // 短暂移动200ms
+    stopMotors();
+    // Serial.println("Brief backward movement completed");
+  }
+}
+
+void buttonLCallback(const String & state) {
+  BLINKER_LOG("收到左转按钮: ", state);
+  // Serial.printf("=== buttonLCallback called with state: %s ===\n", state.c_str());
+  
+  if (state == BLINKER_CMD_ON) {
+    // 按下时开始左转
+    // Serial.println("Button pressed - starting left turn");
+    turnLeft();
+  } else if (state == BLINKER_CMD_OFF) {
+    // 松开时停止
+    // Serial.println("Button released - stopping motors");
+    stopMotors();
+  } else if (state == BLINKER_CMD_BUTTON_PRESSED) {
+    // 长按开始 - 开始左转
+    // Serial.println("Button long pressed - starting left turn");
+    turnLeft();
+  } else if (state == BLINKER_CMD_BUTTON_RELEASED) {
+    // 长按释放 - 停止
+    // Serial.println("Button long released - stopping motors");
+    stopMotors();
+  } else if (state == "tap" || state == BLINKER_CMD_BUTTON_TAP) {
+    // 处理点击事件 - 短暂左转
+    // Serial.println("Button tapped - brief left turn");
+    turnLeft();
+    delay(200);  // 短暂转向200ms
+    stopMotors();
+    // Serial.println("Brief left turn completed");
+  }
+}
+
+void buttonRCallback(const String & state) {
+  BLINKER_LOG("收到右转按钮: ", state);
+  // Serial.printf("=== buttonRCallback called with state: %s ===\n", state.c_str());
+  
+  if (state == BLINKER_CMD_ON) {
+    // 按下时开始右转
+    // Serial.println("Button pressed - starting right turn");
+    turnRight();
+  } else if (state == BLINKER_CMD_OFF) {
+    // 松开时停止
+    // Serial.println("Button released - stopping motors");
+    stopMotors();
+  } else if (state == BLINKER_CMD_BUTTON_PRESSED) {
+    // 长按开始 - 开始右转
+    // Serial.println("Button long pressed - starting right turn");
+    turnRight();
+  } else if (state == BLINKER_CMD_BUTTON_RELEASED) {
+    // 长按释放 - 停止
+    // Serial.println("Button long released - stopping motors");
+    stopMotors();
+  } else if (state == "tap" || state == BLINKER_CMD_BUTTON_TAP) {
+    // 处理点击事件 - 短暂右转
+    // Serial.println("Button tapped - brief right turn");
+    turnRight();
+    delay(200);  // 短暂转向200ms
+    stopMotors();
+    // Serial.println("Brief right turn completed");
+  }
+}
+
+// 停止按钮回调函数 - 已移除
+/*
+void buttonSCallback(const String & state) {
+  BLINKER_LOG("收到停止按钮: ", state);
+  // Serial.printf("=== buttonSCallback called with state: %s ===\n", state.c_str());
+  
+  if (state == BLINKER_CMD_BUTTON_TAP || state == "tap") {
+    Serial.println("Stop button pressed - stopping all motors");
+    stopMotors();
+  }
+}
+*/
+
+// 自动模式按钮回调函数 - 已移除
+/*
+void buttonAutoCallback(const String & state) {
+  BLINKER_LOG("收到自动模式按钮: ", state);
+  // Serial.printf("=== buttonAutoCallback called with state: %s ===\n", state.c_str());
+  
+  if (state == BLINKER_CMD_BUTTON_TAP || state == "tap") {
+    // 这里可以添加自动避障模式
+    Serial.println("自动模式启动");
+  }
+}
+*/
+
+void sliderSpeedCallback(int32_t value) {
+  BLINKER_LOG("收到速度滑块: ", value);
+  setSpeedPercent(value);
+  NumberSpeed.print(speedPercent);
+}
+
+void sliderServoCallback(int32_t value) {
+  BLINKER_LOG("收到舵机滑块: ", value);
+  // 将滑块值(0-100)映射到舵机角度(0-180)
+  float angle = map(value, 0, 100, 0, 180);
+  setServoAngle(angle);
+  BLINKER_LOG("舵机角度设置为: ", angle);
+}
+
+// Blinker数据读取回调
+void dataRead(const String & data) {
+  // Serial.println("\n========== dataRead() START ==========");
+  BLINKER_LOG("Blinker readString: ", data);
+  
+  // dataRead主要处理应用请求的数据，不包含距离（距离由实时刷新处理）
+  
+  // 更新速度显示
+  NumberSpeed.print(speedPercent);
+  // Serial.printf("dataRead() -> Speed sent: %d%%\n", speedPercent);
+  
+  // 更新IP地址显示
+  String ipAddress = WiFi.localIP().toString();
+  TextIP.print(ipAddress);
+  // Serial.printf("dataRead() -> IP sent: %s\n", ipAddress.c_str());
+  
+  // Serial.println("=== dataRead() function completed ===");
+}
+
+// Blinker心跳回调 - 增强网络状态监控
+void heartbeat() {
+  Serial.println("\n---------- heartbeat() START ----------");
+  
+  // 网络状态监控和报告
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  int rssi = WiFi.RSSI();
+  
+  Serial.printf("Network Status - WiFi: %s, RSSI: %d dBm, Stable: %s\n", 
+                wifiConnected ? "Connected" : "Disconnected", 
+                rssi, 
+                networkStable ? "Yes" : "No");
+  
+  // 如果网络不稳定，尝试恢复
+  if (!wifiConnected || rssi < -85) {
+    Serial.println("Network issue detected in heartbeat, triggering recovery...");
+    if (!checkWiFiConnection()) {
+      reconnectWiFi();
+    }
+  }
+  
+  // 心跳主要处理系统状态，不包含距离（距离由实时刷新处理）
+  Serial.printf("heartbeat() -> Speed: %d%%\n", speedPercent);
+  NumberSpeed.print(speedPercent);
+  
+  // 更新IP地址显示
+  String ipAddress = WiFi.localIP().toString();
+  TextIP.print(ipAddress);
+  Serial.printf("heartbeat() -> IP sent: %s\n", ipAddress.c_str());
+  
+  // 发送网络状态信息到Blinker（可选）
+  if (networkStable) {
+    // Serial.println("Network stable - heartbeat completed successfully");
+  } else {
+    // Serial.println("Network unstable - recovery actions taken");
+  }
+  
+  // Serial.println("=== heartbeat() function completed ===");
+}
+
+// WiFiManager配置保存回调函数
+void saveConfigCallback() {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
+
+// 检查配网按钮是否被按下
+bool checkConfigButton() {
+  pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
+  return digitalRead(CONFIG_BUTTON_PIN) == LOW;
+}
+
+// WiFi配网函数
+void setupWiFiManager() {
+  Serial.println("Starting WiFi configuration...");
+  
+  // 检查是否需要重置WiFi配置
+  if (checkConfigButton()) {
+    Serial.println("Config button pressed, resetting WiFi settings...");
+    wifiManager.resetSettings();
+    preferences.clear();
+    delay(1000);
+  }
+  
+  // 设置配置保存回调
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  
+  // 设置超时时间（3分钟）
+  wifiManager.setConfigPortalTimeout(180);
+  
+  // 设置AP名称和密码
+  wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+  
+  // 设置配网门户的自定义参数
+  wifiManager.setAPCallback([](WiFiManager *myWiFiManager) {
+    Serial.println("进入配网模式");
+    Serial.println("请连接到WiFi热点: ESP32-S3-Car-Config");
+    Serial.println("密码: 12345678");
+    Serial.println("然后在浏览器中打开: http://192.168.4.1");
+    Serial.println("配置您的WiFi网络信息");
+    
+    // 配网模式下LED闪烁提示
+    for (int i = 0; i < 10; i++) {
+      setLED(true);
+      delay(200);
+      setLED(false);
+      delay(200);
+    }
+  });
+  
+  // 设置配网门户的网页标题和说明
+  wifiManager.setTitle("ESP32-S3智能小车WiFi配置");
+  wifiManager.setConfigPortalBlocking(true);
+  
+  // 尝试连接WiFi，如果失败则启动配网门户
+  if (!wifiManager.autoConnect("ESP32-S3-Car-Config", "12345678")) {
+    Serial.println("配网超时或失败，重启设备...");
+    // 重启设备
+    ESP.restart();
+  }
+  
+  // 如果到达这里，说明WiFi连接成功
+  Serial.println("WiFi连接成功!");
+  Serial.print("IP地址: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("连接的WiFi: ");
+  Serial.println(WiFi.SSID());
+  
+  // 保存配置到NVS
+  if (shouldSaveConfig) {
+    preferences.begin("wifi-config", false);
+    preferences.putString("ssid", WiFi.SSID());
+    preferences.putString("password", WiFi.psk());
+    preferences.end();
+    Serial.println("WiFi配置已保存到设备存储");
+  }
+  
+  // 连接成功后LED常亮2秒
+  setLED(true);
+  delay(2000);
+  setLED(false);
+}
 
 void setup() {
   Serial.begin(9600);  // 使用9600波特率，与HC-SR04例程保持一致
   Serial.println("ESP32-S3 Smart Car initialization started...");
+  
+  // Configure watchdog timer for better stability
+  esp_task_wdt_init(30, true);  // 30 second timeout, panic on timeout
+  esp_task_wdt_add(NULL);       // Add current task to watchdog
   
   // GPIO initialization
   pinMode(MOTOR_IN1, OUTPUT);
@@ -1569,7 +2051,7 @@ void setup() {
   pinMode(ULTRASONIC_TRIG, OUTPUT);
   pinMode(ULTRASONIC_ECHO, INPUT);
   pinMode(LED_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
+  // pinMode(BUZZER_PIN, OUTPUT);
   
   // 舵机引脚初始化
   pinMode(SERVO_PIN, OUTPUT); // 舵机控制引脚
@@ -1589,34 +2071,16 @@ void setup() {
   
   // Startup prompt
   setLED(true);
-  beep(100);
+  //beep(100);
   delay(100);
-  beep(100);
+  //beep(100);
   setLED(false);
 
-  // WiFi connection (optimized connection logic)
-  Serial.printf("Connecting to WiFi: %s\n", ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  // WiFi配网设置 (使用WiFiManager)
+  setupWiFiManager();
   
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 30) {
-    delay(1000);
-    Serial.print(".");
-    setLED(retries % 2);
-    retries++;
-  }
-  
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nWiFi connection failed, starting AP mode");
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32-S3-Car", "12345678");
-    Serial.printf("AP mode started, IP: %s\n", WiFi.softAPIP().toString().c_str());
-  } else {
-    Serial.printf("\nWiFi connected successfully, IP address: %s\n", WiFi.localIP().toString().c_str());
-  }
-  
-  // Web server configuration
+  /*
+  // Web server configuration (commented out due to AsyncTCP conflict with Blinker)
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/html", webPage);
   });
@@ -1727,33 +2191,66 @@ void setup() {
   
   server.begin();
   Serial.println("Web server started successfully");
+  */
 
   // Blinker initialization
-  /*
   if (WiFi.status() == WL_CONNECTED) {
-    Blinker.begin(auth, ssid, password);
+    // 获取保存的WiFi凭据用于Blinker初始化
+    preferences.begin("wifi-config", true);
+    String savedSSID = preferences.getString("ssid", "");
+    String savedPassword = preferences.getString("password", "");
+    preferences.end();
+    
+    if (savedSSID.length() > 0 && savedPassword.length() > 0) {
+      Blinker.begin(auth, savedSSID.c_str(), savedPassword.c_str());
+    } else {
+      // 如果没有保存的凭据，使用当前连接的WiFi信息
+      Blinker.begin(auth, WiFi.SSID().c_str(), WiFi.psk().c_str());
+    }
     delay(500);
     
-    // Bind callback functions
+    // 绑定回调函数
     ButtonF.attach(buttonFCallback);
     ButtonB.attach(buttonBCallback);
     ButtonL.attach(buttonLCallback);
     ButtonR.attach(buttonRCallback);
-    ButtonS.attach(buttonSCallback);
-    ButtonAuto.attach(buttonAutoCallback);
+    // ButtonS.attach(buttonSCallback);  // 移除停止按钮
+    // ButtonAuto.attach(buttonAutoCallback);  // 移除自动模式按钮
     SliderSpeed.attach(sliderSpeedCallback);
+    SliderServo.attach(sliderServoCallback);
+    
+    // 绑定数据读取和心跳回调
+    Blinker.attachData(dataRead);
+    Blinker.attachHeartbeat(heartbeat);
+    
+    // 优化初始数据发送 - 减少延时
+    delay(500); // 减少等待时间从1000ms到500ms
+    
+    // 批量发送初始数据
+    float distance = getDistance();
+    if (distance < 999.0) {
+      NumberDistance.print(distance);
+    }
+    NumberSpeed.print(speedPercent);
+    String ipAddress = WiFi.localIP().toString();
+    TextIP.print(ipAddress);
+    
+    // 初始化网络状态变量
+    networkStable = true;
+    lastWiFiCheck = millis();
+    lastBlinkerUpdate = millis();
     
     Serial.println("Blinker initialization completed");
+    Serial.printf("IP Address: %s\n", ipAddress.c_str());
   }
-  */
   
-  Serial.println("=== ESP32-S3 Smart Car System Initialization Complete ===");
+  // Serial.println("=== ESP32-S3 Smart Car System Initialization Complete ===");
   Serial.printf("Memory usage: %d KB\n", (ESP.getHeapSize() - ESP.getFreeHeap()) / 1024);
   
   // Completion prompt
   for (int i = 0; i < 3; i++) {
     setLED(true);
-    beep(50);
+    //beep(50);
     delay(100);
     setLED(false);
     delay(100);
@@ -1764,18 +2261,121 @@ void loop() {
   // Add watchdog reset at the beginning of loop
   esp_task_wdt_reset();
   
-  // WiFi connection check (less frequent)
-  static unsigned long lastWiFiCheck = 0;
-  if (millis() - lastWiFiCheck > 60000) { // Check every 60 seconds
-    lastWiFiCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi connection lost, attempting reconnection...");
-      WiFi.reconnect();
+  // 检查串口命令
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command == "reset_wifi" || command == "RESET_WIFI") {
+      Serial.println("收到WiFi重置命令，清除WiFi配置...");
+      wifiManager.resetSettings();
+      preferences.begin("wifi-config", false);
+      preferences.clear();
+      preferences.end();
+      Serial.println("WiFi配置已清除，设备将重启进入配网模式...");
+      delay(1000);
+      ESP.restart();
+    } else if (command == "wifi_status" || command == "WIFI_STATUS") {
+      Serial.println("=== WiFi状态信息 ===");
+      Serial.printf("连接状态: %s\n", WiFi.status() == WL_CONNECTED ? "已连接" : "未连接");
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("WiFi名称: %s\n", WiFi.SSID().c_str());
+        Serial.printf("IP地址: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("信号强度: %d dBm\n", WiFi.RSSI());
+      }
+      Serial.println("==================");
+    } else if (command == "help" || command == "HELP") {
+      Serial.println("=== 可用命令 ===");
+      Serial.println("reset_wifi  - 重置WiFi配置");
+      Serial.println("wifi_status - 查看WiFi状态");
+      Serial.println("help        - 显示帮助信息");
+      Serial.println("===============");
     }
-    // Reset watchdog after WiFi operations
-    esp_task_wdt_reset();
   }
   
-  // Minimal delay for better web responsiveness
+  // Enhanced network health monitoring and auto-recovery
+  unsigned long currentTime = millis();
+  if (currentTime - lastWiFiCheck > WIFI_CHECK_INTERVAL) {
+    lastWiFiCheck = currentTime;
+    
+    // Comprehensive network health check
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    int currentRSSI = WiFi.RSSI();
+    
+    // Update network stability status
+    if (wifiConnected && currentRSSI > -85) {
+      if (!networkStable) {
+        Serial.println("🔄 Network recovered - marking as stable");
+        networkStable = true;
+        wifiReconnectAttempts = 0; // Reset reconnect attempts
+      }
+    } else {
+      if (networkStable) {
+        Serial.println("⚠️ Network degraded - marking as unstable");
+        networkStable = false;
+      }
+      
+      // Trigger recovery if needed
+      if (!checkWiFiConnection()) {
+        Serial.println("🔧 Initiating network recovery...");
+        reconnectWiFi();
+      }
+    }
+    
+    // Log network status periodically
+    Serial.printf("📊 Network Health: WiFi=%s, RSSI=%d dBm, Stable=%s, Attempts=%d\n",
+                  wifiConnected ? "OK" : "FAIL", 
+                  currentRSSI, 
+                  networkStable ? "YES" : "NO",
+                  wifiReconnectAttempts);
+  }
+  
+  // Optimized Blinker data updates (reduced frequency)
+  if (currentTime - lastBlinkerUpdate > BLINKER_UPDATE_INTERVAL && networkStable) {
+    lastBlinkerUpdate = currentTime;
+    
+    // Batch update all sensor data to reduce network calls
+    float distance = getDistance();
+    if (distance >= 2 && distance < 600.0) {
+      NumberDistance.print(distance);
+      Serial.printf("✅ 距离数据已发送: %.2f cm\n", distance);
+    }
+    
+    // Update speed info less frequently
+    static int lastSpeedSent = -1;
+    if (speedPercent != lastSpeedSent) {
+      NumberSpeed.print(speedPercent);
+      lastSpeedSent = speedPercent;
+      Serial.printf("✅ 速度数据已发送: %d%%\n", speedPercent);
+    }
+    
+    // Update IP only when changed
+    static String lastIPSent = "";
+    String currentIP = WiFi.localIP().toString();
+    if (currentIP != lastIPSent && WiFi.status() == WL_CONNECTED) {
+      TextIP.print(currentIP);
+      lastIPSent = currentIP;
+      Serial.printf("✅ IP地址已发送: %s\n", currentIP.c_str());
+    }
+  }
+  
+  // Blinker运行 - 仅在网络稳定时运行以避免错误
+  if (networkStable && WiFi.status() == WL_CONNECTED) {
+    Blinker.run();
+  } else {
+    // 网络不稳定时，减少Blinker调用频率
+    static unsigned long lastBlinkerAttempt = 0;
+    if (currentTime - lastBlinkerAttempt > 1000) { // 每秒尝试一次
+      lastBlinkerAttempt = currentTime;
+      Serial.println("⚠️ Network unstable - skipping Blinker.run()");
+      
+      // 尝试轻量级的网络检查
+      if (WiFi.status() == WL_CONNECTED) {
+        Blinker.run();
+      }
+    }
+  }
+  
+  // Minimal delay for better responsiveness
   delay(5);
 }
