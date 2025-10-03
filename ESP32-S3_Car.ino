@@ -9,6 +9,9 @@
 #include "driver/ledc.h"
 #include "esp_task_wdt.h"  // Add watchdog timer header
 #include "esp_wifi.h"      // Add WiFi advanced control
+#include "esp_sleep.h"     // ESP32深度睡眠库
+#include <U8g2lib.h>       // U8g2图形库，支持多种单色显示屏
+#include <SPI.h>           // SPI通信库 - LCD9648使用SPI接口
 
 // WiFi Configuration (使用WiFiManager进行配网)
 // const char* ssid = "CU_204";        // 注释掉硬编码的WiFi配置
@@ -49,6 +52,14 @@ int lastRSSI = 0;
 #define LED_PIN           48  // GPIO48 - Status LED
 // #define BUZZER_PIN        7   // GPIO7 - Buzzer
 
+// LCD9648 (ST7565) 显示屏引脚定义 - SPI接口
+#define LCD_RST           14  // GPIO8 - LCD复位信号 (Reset)
+#define LCD_CS            13   // GPIO7 - LCD片选信号 (Chip Select)
+#define LCD_RS            12   // GPIO9 - LCD数据/命令选择 (A0/DC)           10  // GPIO10 - LCD时钟信号 (Serial Clock)
+#define LCD_SDA           11  // GPIO11 - LCD数据信号 (Serial Data)
+#define LCD_SCL           10  // GPIO10 - LCD时钟信号 (Serial Clock)
+
+
 // Global variables
 int motorSpeed = 200;        // Motor speed (50-255)
 int speedPercent = 78;       // Speed percentage (20-100%)
@@ -61,11 +72,18 @@ float cachedDistance = 999.0;
 unsigned long lastSensorRead = 0;
 const unsigned long SENSOR_READ_INTERVAL = 200;  // Read sensor every 200ms instead of every call
 
+// LCD9648 (ST7565) 显示屏对象和变量
+U8G2_ST7565_ERC12864_ALT_F_4W_SW_SPI u8g2(U8G2_R0, LCD_SCL, LCD_SDA, LCD_CS, LCD_RS, LCD_RST);
+unsigned long lastLCDUpdate = 0;
+const unsigned long LCD_UPDATE_INTERVAL = 500;  // 提高LCD更新频率：1秒->0.5秒，增强实时性
+bool lcdInitialized = false;
+
 // Blinker button definitions
 BlinkerButton ButtonF("btn-f");      // 前进按钮
 BlinkerButton ButtonB("btn-b");      // 后退按钮
 BlinkerButton ButtonL("btn-l");      // 左转按钮
 BlinkerButton ButtonR("btn-r");      // 右转按钮
+BlinkerButton ButtonSleep("btn-sleep"); // 睡眠开关按钮
 // BlinkerButton ButtonS("btn-s");      // 停止按钮 - 已移除
 // BlinkerButton ButtonAuto("btn-auto"); // 自动模式按钮 - 已移除
 BlinkerSlider SliderSpeed("slider-speed"); // 速度滑块
@@ -155,6 +173,87 @@ void systemRestart(const char* reason) {
   ESP.restart();
 }
 
+// LCD显示用的距离缓存变量
+float lastValidDistance = 0.0;
+unsigned long lastValidDistanceTime = 0;
+const unsigned long DISTANCE_CACHE_TIMEOUT = 1500; // 缩短缓存超时：3秒->1.5秒，增强实时性
+
+// LCD9648显示功能函数
+void updateLCDDisplay() {
+  if (!lcdInitialized) return;
+  
+  u8g2.clearBuffer();
+  
+  // 使用更粗的字体以增加浓度和可读性
+  u8g2.setFont(u8g2_font_6x10_tf);  // 使用粗体字体
+  
+  // 第一行：系统状态
+  String wifiStatus = WiFi.status() == WL_CONNECTED ? "WiFi:OK" : "WiFi:--";
+  String networkStatus = networkStable ? " Net:OK" : " Net:--";
+  u8g2.drawStr(0, 9, (wifiStatus + networkStatus).c_str());
+  
+  // 第二行：距离信息 - 使用智能缓存机制
+  float currentDistance = getDistance();
+  String distanceStr;
+  
+  // 调试输出
+  // Serial.print("LCD显示距离: ");
+  // Serial.println(currentDistance);
+  
+  // 智能缓存逻辑：如果当前读数有效，使用并缓存；如果无效但缓存未过期，使用缓存
+  if (currentDistance >= 2.0 && currentDistance < 600.0) {
+    // 当前读数有效，更新缓存
+    lastValidDistance = currentDistance;
+    lastValidDistanceTime = millis();
+    distanceStr = "Dist:" + String(currentDistance, 1) + "cm";
+  } else {
+    // 当前读数无效，检查缓存
+    unsigned long currentTime = millis();
+    if (lastValidDistance > 0 && (currentTime - lastValidDistanceTime) < DISTANCE_CACHE_TIMEOUT) {
+      // 使用缓存的有效距离
+      distanceStr = "Dist:" + String(lastValidDistance, 1) + "cm";
+      // Serial.print("使用缓存距离: ");
+      // Serial.println(lastValidDistance);
+    } else {
+      // 缓存也过期了，显示错误状态
+      distanceStr = "Dist:---cm";
+    }
+  }
+  
+  u8g2.drawStr(0, 21, distanceStr.c_str());
+  
+  // 第三行：速度信息
+  String speedStr = "Speed:" + String(speedPercent) + "%";
+  u8g2.drawStr(0, 33, speedStr.c_str());
+  
+  // 第四行：当前动作状态（简化显示）
+  String actionStr = "Status:READY";
+  u8g2.drawStr(0, 45, actionStr.c_str());
+  
+  u8g2.sendBuffer();
+}
+
+void displayLCDMessage(const char* line1, const char* line2 = "", const char* line3 = "", const char* line4 = "") {
+  if (!lcdInitialized) return;
+  
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);  // 使用与updateLCDDisplay相同的粗体字体
+  
+  if (strlen(line1) > 0) u8g2.drawStr(0, 14, line1);
+  if (strlen(line2) > 0) u8g2.drawStr(0, 28, line2);
+  if (strlen(line3) > 0) u8g2.drawStr(0, 42, line3);
+  if (strlen(line4) > 0) u8g2.drawStr(0, 56, line4);
+  
+  u8g2.sendBuffer();
+}
+
+void clearLCDDisplay() {
+  if (!lcdInitialized) return;
+  
+  u8g2.clearBuffer();
+  u8g2.sendBuffer();
+}
+
 // Status indication
 void setLED(bool state) {
   digitalWrite(LED_PIN, state);
@@ -227,25 +326,47 @@ void moveForward() {
   if (!checkSafeToMoveForward()) {
     // Serial.println("Forward blocked - obstacle detected");
     //beep(100);
+    displayLCDMessage("BLOCKED!", "Obstacle", "Detected", "");  // 显示障碍物检测信息
+    delay(1000);
     return;
   }
   setMotorSpeed(motorSpeed, motorSpeed);
   // Serial.printf("Forward - Motor speed: %d\n", motorSpeed);
+  
+  // 立即更新LCD显示当前动作
+  if (lcdInitialized) {
+    lastLCDUpdate = 0; // 强制立即更新
+  }
 }
 
 void moveBackward() {
   setMotorSpeed(-motorSpeed, -motorSpeed);
   // Serial.println("Backward");
+  
+  // 立即更新LCD显示当前动作
+  if (lcdInitialized) {
+    lastLCDUpdate = 0; // 强制立即更新
+  }
 }
 
 void turnLeft() {
   setMotorSpeed(motorSpeed, -motorSpeed);
   // Serial.println("Turn Left");
+  
+  // 立即更新LCD显示当前动作
+  if (lcdInitialized) {
+    lastLCDUpdate = 0; // 强制立即更新
+  }
 }
 
 void turnRight() {
   setMotorSpeed(-motorSpeed, motorSpeed);
   // Serial.println("Turn Right");
+  
+  // 立即更新LCD显示当前动作
+  if (lcdInitialized) {
+    lastLCDUpdate = 0; // 强制立即更新
+  }
 }
 
 // Mecanum wheel strafe movement functions (left/right side movement)
@@ -305,6 +426,11 @@ void rotateRight() {
 void stopMotors() {
   setMotorSpeed(0, 0);
   // Serial.println("Stop");
+  
+  // 立即更新LCD显示当前动作
+  if (lcdInitialized) {
+    lastLCDUpdate = 0; // 强制立即更新
+  }
 }
 
 // Speed control functions
@@ -326,104 +452,67 @@ unsigned long Len_Integer = 0; //
 unsigned int Len_Fraction = 0;
 
 float getDistance() {
-  // Use cached distance if recent reading is available
-  unsigned long currentTime = millis();
-  if (currentTime - lastSensorRead < SENSOR_READ_INTERVAL && cachedDistance < 999.0) {
-    // Serial.printf("Using cached distance: %.2fcm (age: %lums)\n", 
-    //               cachedDistance, currentTime - lastSensorRead);
-    return cachedDistance;
-  }
+  // 优化的超声波测距，平衡实时性和稳定性
+  const int SAMPLE_COUNT = 3;  // 减少采样次数：5->3，提高响应速度
+  float validReadings[SAMPLE_COUNT];
+  int validCount = 0;
   
-  // Serial.println("=== 开始超声波测距 ===");
-  
-  // 确保引脚状态正确
-  pinMode(ULTRASONIC_TRIG, OUTPUT);
-  pinMode(ULTRASONIC_ECHO, INPUT);
-  
-  // 触发超声波脉冲 (严格按照HC-SR04时序)
-  digitalWrite(ULTRASONIC_TRIG, LOW);
-  delayMicroseconds(5);  // 增加稳定时间
-  digitalWrite(ULTRASONIC_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(ULTRASONIC_TRIG, LOW);
-  
-  // Serial.println("触发脉冲已发送");
-  // Serial.printf("TRIG引脚状态: %d, ECHO引脚状态: %d\n", 
-  //               digitalRead(ULTRASONIC_TRIG), digitalRead(ULTRASONIC_ECHO));
-  
-  // 测量回波时间，设置30ms超时（对应约5米最大距离）
-  Time_Echo_us = pulseIn(ULTRASONIC_ECHO, HIGH, 30000);
-  
-  // Serial.print("回波时间: ");
-  // Serial.print(Time_Echo_us);
-  // Serial.println(" 微秒");
-  
-  // 详细的调试信息
-  if (Time_Echo_us == 0) {
-    // Serial.println("❌ 超声波测距失败: 完全超时，可能是硬件连接问题");
-    // Serial.println("请检查:");
-    // Serial.println("1. TRIG引脚(GPIO4)连接是否正常");
-    // Serial.println("2. ECHO引脚(GPIO5)连接是否正常");
-    // Serial.println("3. 传感器电源是否为5V");
-    // Serial.println("4. 传感器前方是否有障碍物");
-    return 999.0;
-  }
-  
-  if (Time_Echo_us > 30000) {
-    // Serial.printf("❌ 回波时间过长: %d微秒 (>30ms)\n", Time_Echo_us);
-    // Serial.println("可能原因: 没有障碍物反射或传感器故障");
-    return 999.0;
-  }
-  
-  if (Time_Echo_us < 150) {  // 约2.5cm对应的最小时间
-    // Serial.printf("❌ 回波时间过短: %d微秒 (<150μs)\n", Time_Echo_us);
-    // Serial.println("可能原因: 传感器过近或信号干扰");
-    return 999.0;
-  }
-  
-  // HC-SR04超声波距离计算
-  if ((Time_Echo_us < 30000) && (Time_Echo_us > 150)) {
-    Len_mm_X100 = (Time_Echo_us * 34) / 2;
-    Len_Integer = Len_mm_X100 / 100;
-    Len_Fraction = Len_mm_X100 % 100;
+  // 进行多次测量
+  for (int i = 0; i < SAMPLE_COUNT; i++) {
+    // 确保引脚状态正确
+    pinMode(ULTRASONIC_TRIG, OUTPUT);
+    pinMode(ULTRASONIC_ECHO, INPUT);
     
-    // Serial.print("Present Length is: ");
-    // Serial.print(Len_Integer, DEC);
-    // Serial.print(".");
-    // if (Len_Fraction < 10) {
-    //   Serial.print("0");
-    // }
-    // Serial.print(Len_Fraction, DEC);
-    // Serial.println("mm");
+    // 触发超声波脉冲 (严格按照HC-SR04时序)
+    digitalWrite(ULTRASONIC_TRIG, LOW);
+    delayMicroseconds(2);  // 减少稳定时间：5->2微秒
+    digitalWrite(ULTRASONIC_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(ULTRASONIC_TRIG, LOW);
     
-    // 转换为cm并返回
-    float distance_cm = Len_Integer / 10.0 + Len_Fraction / 1000.0;
+    // 测量回波时间，设置30ms超时（对应约5米最大距离）
+    Time_Echo_us = pulseIn(ULTRASONIC_ECHO, HIGH, 30000);
     
-    // 范围检查 (2cm - 400cm)
-    if (distance_cm < 2.0) {
-      // Serial.printf("❌ 距离过近: %.2fcm (<2cm)\n", distance_cm);
-      return 999.0;
-    }
-    if (distance_cm > 400.0) {
-      // Serial.printf("❌ 距离过远: %.2fcm (>400cm)\n", distance_cm);
-      return 999.0;
+    // 检查测量是否有效
+    if (Time_Echo_us > 150 && Time_Echo_us < 30000) {
+      // HC-SR04超声波距离计算
+      Len_mm_X100 = (Time_Echo_us * 34) / 2;
+      Len_Integer = Len_mm_X100 / 100;
+      Len_Fraction = Len_mm_X100 % 100;
+      
+      // 转换为cm
+      float distance_cm = Len_Integer / 10.0 + Len_Fraction / 1000.0;
+      
+      // 范围检查 (2cm - 600cm)
+      if (distance_cm >= 2.0 && distance_cm <= 600.0) {
+        validReadings[validCount] = distance_cm;
+        validCount++;
+      }
     }
     
-    // Serial.printf("✅ 测距成功: %.2fcm\n", distance_cm);
-    
-    // Update cache
-    cachedDistance = distance_cm;
-    lastSensorRead = millis();
-    
-    return distance_cm;
+    // 缩短采样间隔：20ms->10ms，提高响应速度
+    if (i < SAMPLE_COUNT - 1) {
+      delay(10);  
+    }
   }
   
-  // Serial.println("❌ 未知错误");
+  // 如果没有有效读数，返回错误值
+  if (validCount == 0) {
+    return 999.0;
+  }
   
-  // Don't cache error values, but update timestamp to prevent rapid retries
+  // 计算有效读数的平均值
+  float sum = 0;
+  for (int i = 0; i < validCount; i++) {
+    sum += validReadings[i];
+  }
+  float avgDistance = sum / validCount;
+  
+  // 更新缓存变量（保持兼容性）
+  cachedDistance = avgDistance;
   lastSensorRead = millis();
   
-  return 999.0; // 测量失败
+  return avgDistance;
 }
 
 // Global variable to track current servo angle (with 0.09 degree precision)
@@ -535,6 +624,7 @@ void buttonAutoCallback(const String &state) {
     }
   }
 }
+
 
 void sliderSpeedCallback(int32_t value) {
   motorSpeed = constrain(value, 50, 255);
@@ -1879,6 +1969,48 @@ void buttonAutoCallback(const String & state) {
 }
 */
 
+// 睡眠开关按钮回调函数
+void buttonSleepCallback(const String & state) {
+  BLINKER_LOG("收到睡眠开关: ", state);
+  
+  if (state == BLINKER_CMD_ON) {
+    // 开关打开 - 进入睡眠模式
+    Serial.println("睡眠模式激活，系统将进入深度睡眠...");
+    
+    // 停止所有电机
+    stopMotors();
+    
+    // 关闭舵机
+    servoActive = false;
+    
+    // 清空LCD显示
+    if (lcdInitialized) {
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_7x13B_tf);
+      u8g2.drawStr(20, 30, "Sleep Mode");
+      u8g2.sendBuffer();
+      delay(2000);
+      u8g2.clearDisplay();
+    }
+    
+    // 发送睡眠确认消息
+    Blinker.notify("ESP32进入睡眠模式");
+    delay(1000);
+    
+    // 配置唤醒源 - 使用GPIO0作为唤醒按钮
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // 低电平唤醒
+    
+    // 进入深度睡眠
+    Serial.println("进入深度睡眠模式...");
+    esp_deep_sleep_start();
+    
+  } else if (state == BLINKER_CMD_OFF) {
+    // 开关关闭 - 正常运行模式
+    Serial.println("系统恢复正常运行模式");
+    Blinker.notify("ESP32恢复正常运行");
+  }
+}
+
 void sliderSpeedCallback(int32_t value) {
   BLINKER_LOG("收到速度滑块: ", value);
   setSpeedPercent(value);
@@ -2038,6 +2170,21 @@ void setupWiFiManager() {
 void setup() {
   Serial.begin(9600);  // 使用9600波特率，与HC-SR04例程保持一致
   Serial.println("ESP32-S3 Smart Car initialization started...");
+  
+  // 检查唤醒原因
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch(wakeup_reason) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      Serial.println("从外部信号唤醒 (GPIO0)");
+      break;
+    case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println("从定时器唤醒");
+      break;
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+    default:
+      Serial.println("正常启动或重启");
+      break;
+  }
   
   // Configure watchdog timer for better stability
   esp_task_wdt_init(30, true);  // 30 second timeout, panic on timeout
@@ -2214,6 +2361,7 @@ void setup() {
     ButtonB.attach(buttonBCallback);
     ButtonL.attach(buttonLCallback);
     ButtonR.attach(buttonRCallback);
+    ButtonSleep.attach(buttonSleepCallback);  // 绑定睡眠开关回调
     // ButtonS.attach(buttonSCallback);  // 移除停止按钮
     // ButtonAuto.attach(buttonAutoCallback);  // 移除自动模式按钮
     SliderSpeed.attach(sliderSpeedCallback);
@@ -2243,6 +2391,17 @@ void setup() {
     Serial.println("Blinker initialization completed");
     Serial.printf("IP Address: %s\n", ipAddress.c_str());
   }
+  
+  // LCD9648显示屏初始化
+  Serial.println("Initializing LCD9648 display...");
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);  // 使用粗体字体增加浓度
+  u8g2.drawStr(0, 14, "ESP32-S3 Car");
+  u8g2.drawStr(0, 32, "System Ready");
+  u8g2.sendBuffer();
+  lcdInitialized = true;
+  Serial.println("LCD9648 initialization completed");
   
   // Serial.println("=== ESP32-S3 Smart Car System Initialization Complete ===");
   Serial.printf("Memory usage: %d KB\n", (ESP.getHeapSize() - ESP.getFreeHeap()) / 1024);
@@ -2357,6 +2516,12 @@ void loop() {
       lastIPSent = currentIP;
       Serial.printf("✅ IP地址已发送: %s\n", currentIP.c_str());
     }
+  }
+  
+  // LCD9648显示屏更新
+  if (currentTime - lastLCDUpdate > LCD_UPDATE_INTERVAL) {
+    lastLCDUpdate = currentTime;
+    updateLCDDisplay();
   }
   
   // Blinker运行 - 仅在网络稳定时运行以避免错误
